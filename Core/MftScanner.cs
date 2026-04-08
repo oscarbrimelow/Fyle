@@ -23,6 +23,11 @@ namespace Fyle.Core
 
         public bool IsScanning { get; private set; }
         private CancellationTokenSource? _cts;
+        private readonly ManualResetEventSlim _pauseEvent = new(true);
+        private volatile bool _isPaused;
+        public bool IsPaused => _isPaused;
+        private Scanner.ScanOptions _options = Scanner.ScanOptions.Default;
+        private HashSet<string> _excluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         
         private void Log(string message)
         {
@@ -39,6 +44,8 @@ namespace Fyle.Core
         private const int FSCTL_ENUM_USN_DATA = 0x000900b3;
         private const int FSCTL_QUERY_USN_JOURNAL = 0x000900f4;
         private const int FILE_ATTRIBUTE_DIRECTORY = 0x10;
+        private const int FILE_ATTRIBUTE_HIDDEN = 0x2;
+        private const int FILE_ATTRIBUTE_SYSTEM = 0x4;
 
         [StructLayout(LayoutKind.Sequential)]
         private struct USN_JOURNAL_DATA_V0
@@ -139,6 +146,19 @@ namespace Fyle.Core
             _cts?.Cancel();
         }
 
+        public void Pause()
+        {
+            if (!IsScanning) return;
+            _isPaused = true;
+            _pauseEvent.Reset();
+        }
+
+        public void Resume()
+        {
+            _isPaused = false;
+            _pauseEvent.Set();
+        }
+
         /// <summary>
         /// Check if MFT scanning is available for this drive
         /// </summary>
@@ -161,10 +181,19 @@ namespace Fyle.Core
         /// </summary>
         public async Task<DirectoryNode?> ScanDriveAsync(string drivePath, CancellationToken cancellationToken = default)
         {
+            return await ScanDriveAsync(drivePath, Scanner.ScanOptions.Default, cancellationToken);
+        }
+
+        public async Task<DirectoryNode?> ScanDriveAsync(string drivePath, Scanner.ScanOptions options, CancellationToken cancellationToken = default)
+        {
             if (IsScanning) return null;
 
             IsScanning = true;
+            _isPaused = false;
+            _pauseEvent.Set();
             _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            _options = options ?? Scanner.ScanOptions.Default;
+            _excluded = NormalizeExcludedPaths(_options.ExcludedPaths);
 
             try
             {
@@ -173,6 +202,8 @@ namespace Fyle.Core
             finally
             {
                 IsScanning = false;
+                _isPaused = false;
+                _pauseEvent.Set();
             }
         }
 
@@ -258,6 +289,7 @@ namespace Fyle.Core
                 while (true)
                 {
                     if (_cts?.Token.IsCancellationRequested == true) break;
+                    _pauseEvent.Wait(_cts!.Token);
 
                     if (!DeviceIoControl(handle, FSCTL_ENUM_USN_DATA, ref mftData,
                         Marshal.SizeOf<MFT_ENUM_DATA_V0>(), buffer, bufferSize,
@@ -275,6 +307,8 @@ namespace Fyle.Core
                     while (offset < bytesReturned)
                     {
                         if (offset + Marshal.SizeOf<USN_RECORD_V2>() > bytesReturned) break;
+                        if (_cts?.Token.IsCancellationRequested == true) break;
+                        _pauseEvent.Wait(_cts!.Token);
 
                         var recordPtr = IntPtr.Add(buffer, offset);
                         var recordLength = Marshal.ReadInt32(recordPtr);
@@ -393,6 +427,7 @@ namespace Fyle.Core
             foreach (var entry in entries.Values)
             {
                 if (_cts?.Token.IsCancellationRequested == true) break;
+                _pauseEvent.Wait(_cts!.Token);
 
                 processed++;
                 if (processed % 50000 == 0)
@@ -433,12 +468,39 @@ namespace Fyle.Core
                     {
                         dirNode.Parent = parent;
                         dirNode.Path = Path.Combine(parent.Path ?? rootPath, entry.FileName);
+                        if (IsExcludedPath(dirNode.Path, _excluded))
+                        {
+                            nodes.Remove(fileNum);
+                            continue;
+                        }
+
+                        if (!_options.IncludeHidden && (entry.FileAttributes & FILE_ATTRIBUTE_HIDDEN) != 0)
+                        {
+                            nodes.Remove(fileNum);
+                            continue;
+                        }
+
+                        if (!_options.IncludeSystem && (entry.FileAttributes & FILE_ATTRIBUTE_SYSTEM) != 0)
+                        {
+                            nodes.Remove(fileNum);
+                            continue;
+                        }
+
                         parent.Children.Add(dirNode);
                         linkedDirs++;
                     }
                 }
                 else
                 {
+                    if (!_options.IncludeFiles) continue;
+                    if (parent.Path != null)
+                    {
+                        var candidate = Path.Combine(parent.Path, entry.FileName);
+                        if (IsExcludedPath(candidate, _excluded)) continue;
+                    }
+                    if (!_options.IncludeHidden && (entry.FileAttributes & FILE_ATTRIBUTE_HIDDEN) != 0) continue;
+                    if (!_options.IncludeSystem && (entry.FileAttributes & FILE_ATTRIBUTE_SYSTEM) != 0) continue;
+
                     // File node
                     var fileNode = new DirectoryNode
                     {
@@ -501,6 +563,7 @@ namespace Fyle.Core
             Parallel.ForEach(allFiles, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount * 2 }, file =>
             {
                 if (_cts?.Token.IsCancellationRequested == true) return;
+                _pauseEvent.Wait(_cts!.Token);
 
                 try
                 {
@@ -525,8 +588,33 @@ namespace Fyle.Core
 
             // Calculate directory sizes (bottom-up)
             Log("Calculating directory sizes...");
+            if (_options.MinFileSizeBytes > 0)
+            {
+                PruneSmallFiles(root, _options.MinFileSizeBytes);
+            }
             CalculateDirectorySizes(root);
             Log($"Final root size: {FormatSize(root.Size)}");
+        }
+
+        private static void PruneSmallFiles(DirectoryNode node, long minBytes)
+        {
+            if (node.Children.Count == 0) return;
+
+            for (int i = node.Children.Count - 1; i >= 0; i--)
+            {
+                var child = node.Children[i];
+                if (child.IsDirectory)
+                {
+                    PruneSmallFiles(child, minBytes);
+                }
+                else
+                {
+                    if (child.Size < minBytes)
+                    {
+                        node.Children.RemoveAt(i);
+                    }
+                }
+            }
         }
 
         private void CollectFiles(DirectoryNode node, ConcurrentBag<DirectoryNode> files)
@@ -594,6 +682,36 @@ namespace Fyle.Core
                 len /= 1024;
             }
             return $"{len:0.##} {sizes[order]}";
+        }
+
+        private static HashSet<string> NormalizeExcludedPaths(IEnumerable<string>? excludedPaths)
+        {
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (excludedPaths == null) return set;
+
+            foreach (var p in excludedPaths)
+            {
+                if (string.IsNullOrWhiteSpace(p)) continue;
+                var normalized = p.Trim().TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                if (normalized.Length == 0) continue;
+                set.Add(normalized);
+            }
+            return set;
+        }
+
+        private static bool IsExcludedPath(string? path, HashSet<string> excluded)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return false;
+            if (excluded.Count == 0) return false;
+
+            var normalized = path.Trim().TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            foreach (var ex in excluded)
+            {
+                if (normalized.Equals(ex, StringComparison.OrdinalIgnoreCase)) return true;
+                if (normalized.StartsWith(ex + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) return true;
+                if (normalized.StartsWith(ex + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
         }
     }
 }

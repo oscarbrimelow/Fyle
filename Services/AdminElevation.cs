@@ -92,15 +92,7 @@ namespace Fyle.Services
             var exePath = System.AppContext.BaseDirectory + "Fyle.exe";
             if (!System.IO.File.Exists(exePath))
             {
-                var location = System.Reflection.Assembly.GetExecutingAssembly().Location;
-                if (!string.IsNullOrEmpty(location))
-                {
-                    exePath = location;
-                }
-                else
-                {
-                    exePath = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName ?? "Fyle.exe";
-                }
+                exePath = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName ?? "Fyle.exe";
             }
             return exePath;
         }

@@ -3,10 +3,13 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using Microsoft.VisualBasic.FileIO;
 using Fyle.Core;
 using Fyle.Services;
 using static Fyle.Services.Logger;
@@ -19,12 +22,43 @@ namespace Fyle.UI
         private DirectoryNode? _rootNode;
         private readonly Stack<DirectoryNode> _navigationStack = new();
         private int _colorMode = 0; // 0=Size, 1=Type, 2=Age
+        private string _filterText = "";
+        private int _filterTypeIndex;
+        private long _minSizeBytes;
+        private bool _includeFiles = true;
+        private string _ownerFilter = "";
+        private readonly HashSet<string> _excludedPaths = new(StringComparer.OrdinalIgnoreCase);
+        private int _maxItemsToRender = 5000;
+        private readonly Dictionary<string, string> _ownerCache = new(StringComparer.OrdinalIgnoreCase);
 
         public event Action<DirectoryNode>? NodeSelected;
+        public event Action<string>? ExcludePathRequested;
         
         public void SetColorMode(int mode)
         {
             _colorMode = mode;
+        }
+
+        public void SetFilter(string? filterText, int filterTypeIndex, long minSizeBytes, bool includeFiles, string? ownerFilter, IEnumerable<string>? excludedPaths, int maxItemsToRender)
+        {
+            _filterText = (filterText ?? "").Trim();
+            _filterTypeIndex = filterTypeIndex;
+            _minSizeBytes = Math.Max(0, minSizeBytes);
+            _includeFiles = includeFiles;
+            _ownerFilter = (ownerFilter ?? "").Trim();
+            _maxItemsToRender = maxItemsToRender <= 0 ? 5000 : maxItemsToRender;
+
+            _excludedPaths.Clear();
+            if (excludedPaths != null)
+            {
+                foreach (var p in excludedPaths)
+                {
+                    if (string.IsNullOrWhiteSpace(p)) continue;
+                    var normalized = p.Trim().TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                    if (normalized.Length == 0) continue;
+                    _excludedPaths.Add(normalized);
+                }
+            }
         }
 
         public TreemapView()
@@ -98,7 +132,7 @@ namespace Fyle.UI
                 var availableSpace = new System.Windows.Rect(8, 8, ActualWidth - 16, ActualHeight - 16);
                 if (availableSpace.Width <= 0 || availableSpace.Height <= 0) return;
 
-                var items = TreemapLayout.CalculateLayout(_currentNode, availableSpace, 1);
+                var items = TreemapLayout.CalculateLayout(GetFilteredChildren(_currentNode), availableSpace, 1);
                 if (items == null) return;
                 
                 VisibleItemCount = items.Count;
@@ -184,7 +218,7 @@ namespace Fyle.UI
                 border.MouseLeftButtonDown += (s, e) =>
                 {
                     e.Handled = true;
-                    if (item.Node.IsDirectory && item.Node.Children.Count > 0)
+                    if (item.Node != null && item.Node.IsDirectory && (item.Node.Children?.Count ?? 0) > 0)
                     {
                         _navigationStack.Push(_currentNode!);
                         DisplayNode(item.Node);
@@ -201,7 +235,7 @@ namespace Fyle.UI
                     border.BorderThickness = new Thickness(2);
                     
                     // Show quick preview if enabled (only for folders with children)
-                    if (item.Node.IsDirectory && item.Node.Children.Count > 0)
+                    if (item.Node != null && item.Node.IsDirectory && (item.Node.Children?.Count ?? 0) > 0)
                     {
                         var mainWindow = Window.GetWindow(this) as MainWindow;
                         mainWindow?.ShowQuickPreview(item.Node);
@@ -230,7 +264,7 @@ namespace Fyle.UI
 
                     var nameBlock = new TextBlock
                     {
-                        Text = TruncateText(item.Node.Name, item.Bounds.Width - 12),
+                        Text = TruncateText(item.Node?.Name ?? "", item.Bounds.Width - 12),
                         Foreground = new SolidColorBrush(Colors.White),
                         FontSize = Math.Max(10, Math.Min(13, item.Bounds.Width / 12)),
                         FontWeight = FontWeights.SemiBold,
@@ -249,7 +283,7 @@ namespace Fyle.UI
                     {
                         var sizeBlock = new TextBlock
                         {
-                            Text = item.Node.FormattedSize,
+                            Text = item.Node?.FormattedSize ?? "",
                             Foreground = new SolidColorBrush(Color.FromArgb(220, 255, 255, 255)),
                             FontSize = Math.Max(9, Math.Min(11, item.Bounds.Width / 14)),
                             TextTrimming = TextTrimming.CharacterEllipsis,
@@ -279,6 +313,200 @@ namespace Fyle.UI
             catch (Exception ex)
             {
                 LogError("UpdateTreemap", ex);
+            }
+        }
+
+        private IEnumerable<DirectoryNode> GetFilteredChildren(DirectoryNode node)
+        {
+            if (node.Children == null || node.Children.Count == 0) return Array.Empty<DirectoryNode>();
+
+            IEnumerable<DirectoryNode> children = node.Children;
+            children = children.Where(c => c != null && c.Size > 0);
+            children = children.Where(c => !IsExcluded(c.Path));
+
+            if (!_includeFiles)
+            {
+                children = children.Where(c => c.IsDirectory);
+            }
+
+            if (_minSizeBytes > 0)
+            {
+                children = children.Where(c => c.IsDirectory || c.Size >= _minSizeBytes);
+            }
+
+            if (_filterTypeIndex == 1)
+            {
+                children = children.Where(c => c.IsDirectory);
+            }
+            else if (_filterTypeIndex > 1)
+            {
+                children = children.Where(c => c.IsDirectory ? HasMatchingDescendant(c) : IsCategoryMatch(c));
+            }
+
+            if (!string.IsNullOrWhiteSpace(_ownerFilter))
+            {
+                children = children.Where(c => c.IsDirectory ? HasMatchingDescendant(c) : OwnerMatches(c));
+            }
+
+            if (!string.IsNullOrWhiteSpace(_filterText))
+            {
+                children = children.Where(c => c.IsDirectory ? HasMatchingDescendant(c) : NameMatches(c));
+            }
+
+            children = children.OrderByDescending(c => c.Size);
+            if (_maxItemsToRender > 0)
+            {
+                children = children.Take(_maxItemsToRender);
+            }
+            return children.ToList();
+        }
+
+        private bool NameMatches(DirectoryNode node)
+        {
+            if (string.IsNullOrWhiteSpace(_filterText)) return true;
+            return (node.Name ?? "").Contains(_filterText, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private bool HasMatchingDescendant(DirectoryNode node)
+        {
+            if (node == null) return false;
+            if (_filterTypeIndex <= 1 && string.IsNullOrWhiteSpace(_ownerFilter))
+            {
+                if (!string.IsNullOrWhiteSpace(_filterText) && NameMatches(node)) return true;
+            }
+
+            const int maxDepth = 4;
+            const int maxVisited = 2500;
+            int visited = 0;
+
+            var stack = new Stack<(DirectoryNode Node, int Depth)>();
+            stack.Push((node, 0));
+
+            while (stack.Count > 0)
+            {
+                var (current, depth) = stack.Pop();
+                if (current == null) continue;
+                if (visited++ > maxVisited) return true;
+                if (IsExcluded(current.Path)) continue;
+
+                if (depth > 0)
+                {
+                    if (current.IsDirectory)
+                    {
+                        if (_filterTypeIndex <= 1 && string.IsNullOrWhiteSpace(_ownerFilter))
+                        {
+                            if (!string.IsNullOrWhiteSpace(_filterText) && NameMatches(current)) return true;
+                        }
+                    }
+                    else
+                    {
+                        if (MatchesFileWithActiveFilters(current)) return true;
+                    }
+                }
+
+                if (depth >= maxDepth) continue;
+                if (current.Children == null || current.Children.Count == 0) continue;
+
+                foreach (var child in current.Children)
+                {
+                    if (child == null) continue;
+                    if (!_includeFiles && !child.IsDirectory) continue;
+                    if (_minSizeBytes > 0 && !child.IsDirectory && child.Size < _minSizeBytes) continue;
+                    stack.Push((child, depth + 1));
+                }
+            }
+
+            return false;
+        }
+
+        private bool MatchesFileWithActiveFilters(DirectoryNode node)
+        {
+            if (node.IsDirectory) return false;
+
+            if (!_includeFiles) return false;
+            if (_minSizeBytes > 0 && node.Size < _minSizeBytes) return false;
+            if (!string.IsNullOrWhiteSpace(_ownerFilter) && !OwnerMatches(node)) return false;
+
+            if (!string.IsNullOrWhiteSpace(_filterText))
+            {
+                if (!NameMatches(node)) return false;
+            }
+
+            if (_filterTypeIndex > 1)
+            {
+                return IsCategoryMatch(node);
+            }
+
+            return true;
+        }
+
+        private bool IsCategoryMatch(DirectoryNode node)
+        {
+            if (node.IsDirectory) return false;
+            var ext = Path.GetExtension(node.Name ?? "").ToLowerInvariant();
+            return _filterTypeIndex switch
+            {
+                2 => ext is ".mp4" or ".mkv" or ".avi" or ".mov" or ".wmv" or ".flv" or ".webm" or ".m4v",
+                3 => ext is ".jpg" or ".jpeg" or ".png" or ".gif" or ".bmp" or ".svg" or ".webp" or ".ico" or ".tiff",
+                4 => ext is ".mp3" or ".wav" or ".flac" or ".aac" or ".ogg" or ".wma" or ".m4a",
+                5 => ext is ".pdf" or ".doc" or ".docx" or ".xls" or ".xlsx" or ".ppt" or ".pptx" or ".txt" or ".rtf" or ".odt",
+                6 => ext is ".zip" or ".rar" or ".7z" or ".tar" or ".gz" or ".bz2" or ".xz",
+                7 => ext is ".exe" or ".msi" or ".dll",
+                _ => true
+            };
+        }
+
+        private bool IsExcluded(string? path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return false;
+            if (_excludedPaths.Count == 0) return false;
+
+            var normalized = path.Trim().TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            foreach (var ex in _excludedPaths)
+            {
+                if (normalized.Equals(ex, StringComparison.OrdinalIgnoreCase)) return true;
+                if (normalized.StartsWith(ex + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) return true;
+                if (normalized.StartsWith(ex + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+
+        private bool OwnerMatches(DirectoryNode node)
+        {
+            if (string.IsNullOrWhiteSpace(_ownerFilter)) return true;
+            if (string.IsNullOrWhiteSpace(node.Path)) return false;
+            var owner = GetOwnerCached(node.Path, node.IsDirectory);
+            return string.Equals(owner, _ownerFilter, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private string GetOwnerCached(string path, bool isDirectory)
+        {
+            if (_ownerCache.TryGetValue(path, out var cached)) return cached;
+            var owner = GetOwner(path, isDirectory);
+            _ownerCache[path] = owner;
+            return owner;
+        }
+
+        private static string GetOwner(string path, bool isDirectory)
+        {
+            try
+            {
+                IdentityReference? identity;
+                if (isDirectory)
+                {
+                    var acl = new DirectoryInfo(path).GetAccessControl();
+                    identity = acl.GetOwner(typeof(NTAccount));
+                }
+                else
+                {
+                    var acl = new FileInfo(path).GetAccessControl();
+                    identity = acl.GetOwner(typeof(NTAccount));
+                }
+                return identity?.Value ?? "";
+            }
+            catch
+            {
+                return "";
             }
         }
 
@@ -419,6 +647,16 @@ namespace Fyle.UI
                     }
                 };
                 menu.Items.Add(zoomItem);
+
+                var excludeItem = new MenuItem { Header = "🚫 Exclude Folder" };
+                excludeItem.Click += (s, e) =>
+                {
+                    if (!string.IsNullOrWhiteSpace(node.Path))
+                    {
+                        ExcludePathRequested?.Invoke(node.Path);
+                    }
+                };
+                menu.Items.Add(excludeItem);
             }
             else
             {
@@ -456,7 +694,7 @@ namespace Fyle.UI
             // Delete (with confirmation)
             var deleteItem = new MenuItem 
             { 
-                Header = "🗑️ Delete", 
+                Header = "🗑️ Delete (Recycle Bin)", 
                 Foreground = new SolidColorBrush(Color.FromRgb(248, 113, 113))
             };
             deleteItem.Click += (s, e) => DeleteItem(node);
@@ -529,7 +767,7 @@ namespace Fyle.UI
         private void DeleteItem(DirectoryNode node)
         {
             var result = MessageBox.Show(
-                $"Are you sure you want to delete:\n\n{node.Path}\n\nSize: {node.FormattedSize}\n\nThis action cannot be undone!",
+                $"Move to Recycle Bin?\n\n{node.Path}\n\nSize: {node.FormattedSize}",
                 "Confirm Delete",
                 MessageBoxButton.YesNo,
                 MessageBoxImage.Warning);
@@ -540,11 +778,11 @@ namespace Fyle.UI
                 {
                     if (node.IsDirectory)
                     {
-                        Directory.Delete(node.Path, true);
+                        FileSystem.DeleteDirectory(node.Path, UIOption.OnlyErrorDialogs, RecycleOption.SendToRecycleBin);
                     }
                     else
                     {
-                        File.Delete(node.Path);
+                        FileSystem.DeleteFile(node.Path, UIOption.OnlyErrorDialogs, RecycleOption.SendToRecycleBin);
                     }
 
                     // Remove from parent and refresh

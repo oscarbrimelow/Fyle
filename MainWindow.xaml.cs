@@ -2,7 +2,12 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
+using System.Reflection;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -11,6 +16,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using Fyle.Core;
 using Fyle.Services;
+using Microsoft.VisualBasic.FileIO;
 using Microsoft.Win32;
 using static Fyle.Services.Logger;
 
@@ -33,6 +39,28 @@ namespace Fyle
         private bool _useMftScanning = false;
         private int _topItemsCount = 10;
         private bool _autoRefreshEnabled = false; // Disabled by default for performance
+        private MftScanner? _mftScanner;
+        private CancellationTokenSource? _scanCts;
+        private CancellationTokenSource? _exportCts;
+        private bool _scanUsedMft;
+        private bool _scanIncludeHidden = true;
+        private bool _scanIncludeSystem = true;
+        private bool _scanIncludeFiles = true;
+        private long _scanMinFileSizeBytes;
+        private readonly List<string> _excludedPaths = new();
+        private int _maxItemsToRender = 5000;
+        private long _lastPathUpdateStamp;
+        private long _lastProgressUpdateStamp;
+        private bool _isLoadingSettings;
+        private string _ownerFilter = "";
+        private string _pendingOwnerFilter = "";
+        private readonly Dictionary<string, string> _ownerCache = new(StringComparer.OrdinalIgnoreCase);
+
+        private sealed class OwnerOption
+        {
+            public required string Display { get; init; }
+            public required string Value { get; init; }
+        }
 
         public MainWindow()
         {
@@ -52,6 +80,8 @@ namespace Fyle
                 LoadSettings();
                 UpdateStatisticsVisibility();
                 UpdateLegend();
+
+                TreemapViewControl.ExcludePathRequested += path => Dispatcher.Invoke(() => ExcludePath(path));
                 
                 // Handle command line auto-scan
                 if (!string.IsNullOrEmpty(App.AutoScanPath))
@@ -244,7 +274,12 @@ namespace Fyle
         {
             _scanner.CurrentPathChanged += path =>
             {
-                Dispatcher.Invoke(() =>
+                var now = Stopwatch.GetTimestamp();
+                var last = Interlocked.Read(ref _lastPathUpdateStamp);
+                if (now - last < Stopwatch.Frequency / 8) return;
+                Interlocked.Exchange(ref _lastPathUpdateStamp, now);
+
+                Dispatcher.BeginInvoke(() =>
                 {
                     CurrentPathText.Text = TruncatePath(path, 40);
                     StatusText.Text = $"Scanning: {Path.GetFileName(path)}";
@@ -253,71 +288,15 @@ namespace Fyle
 
             _scanner.ProgressChanged += progress =>
             {
-                Dispatcher.Invoke(() =>
+                var now = Stopwatch.GetTimestamp();
+                var last = Interlocked.Read(ref _lastProgressUpdateStamp);
+                if (now - last < Stopwatch.Frequency / 10 && progress < 99.9) return;
+                Interlocked.Exchange(ref _lastProgressUpdateStamp, now);
+
+                Dispatcher.BeginInvoke(() =>
                 {
                     ScanProgressBar.Value = progress;
                     ProgressText.Text = $"{progress:F0}% • {_scanTimer.Elapsed:mm\\:ss}";
-                });
-            };
-
-            _scanner.ScanCompleted += root =>
-            {
-                Log("ScanCompleted event fired");
-                Dispatcher.Invoke(() =>
-                {
-                    try
-                    {
-                        Log("ScanCompleted - stopping timer");
-                        _scanTimer.Stop();
-                        _currentRoot = root;
-                        
-                        Log($"ScanCompleted - displaying node: {root?.Name}, children: {root?.Children?.Count}");
-                        TreemapViewControl.DisplayNode(root, root);
-                        Log("ScanCompleted - DisplayNode done");
-                        
-                        ScanProgressBar.Visibility = Visibility.Collapsed;
-                        CancelButton.Visibility = Visibility.Collapsed;
-                        ProgressText.Text = "";
-                        RescanButton.IsEnabled = true;
-                        SettingsExportButton.IsEnabled = true;
-                        BackButton.IsEnabled = false;
-                        
-                        Log("ScanCompleted - updating breadcrumb");
-                        UpdateBreadcrumb();
-                        Log("ScanCompleted - updating stats");
-                        UpdateStats(root);
-                        
-                        // These can be slow/crash on large drives, wrap in try-catch
-                        Log("ScanCompleted - updating file type stats");
-                        try { UpdateFileTypeStats(root); } catch (Exception ex) { LogError("UpdateFileTypeStats", ex); }
-                        Log("ScanCompleted - updating largest files");
-                        try { UpdateLargestFiles(root); } catch (Exception ex) { LogError("UpdateLargestFiles", ex); }
-                        Log("ScanCompleted - updating statistics");
-                        try { UpdateStatistics(); } catch (Exception ex) { LogError("UpdateStatistics", ex); }
-                        Log("ScanCompleted - finding duplicates");
-                        try { FindDuplicates(root); } catch (Exception ex) { LogError("FindDuplicates", ex); }
-                        
-                        if (!string.IsNullOrEmpty(_currentDrive) && !_recentScans.Contains(_currentDrive))
-                        {
-                            _recentScans.Insert(0, _currentDrive);
-                            if (_recentScans.Count > 5)
-                                _recentScans.RemoveAt(5);
-                            RecentScansListBox.ItemsSource = _recentScans.ToList();
-                        }
-                        
-                        ScanTimeText.Text = $"⏱ {_scanTimer.Elapsed:mm\\:ss}";
-                        StatusText.Text = $"Scan complete • {root?.Children?.Count ?? 0} items found";
-                        
-                        // Enable buttons
-                        SettingsSaveScanButton.IsEnabled = true;
-                        
-                        Log("ScanCompleted - all done");
-                    }
-                    catch (Exception ex)
-                    {
-                        LogError("ScanCompleted handler", ex);
-                        StatusText.Text = $"Error: {ex.Message}";
-                    }
                 });
             };
         }
@@ -402,21 +381,29 @@ namespace Fyle
         private void UpdateLargestFiles(DirectoryNode root)
         {
             if (root == null) return;
-            
-            var allFiles = GetAllFiles(root, 10000)
-                .Where(f => f != null)
+
+            var files = GetAllFiles(root, 10000)
+                .Where(f => f != null && PassesActiveFilters(f))
                 .OrderByDescending(f => f.Size)
-                .Take(10)
-                .Select(f => new
-                {
-                    Name = f.Name ?? "Unknown",
-                    Path = f.Path ?? "",
-                    Size = FormatBytes(f.Size),
-                    Node = f
-                })
+                .Take(_topItemsCount)
+                .Select(f => new { Name = f.Name ?? "Unknown", Path = f.Path ?? "", Size = FormatBytes(f.Size), Node = f })
                 .ToList();
 
-            LargestFilesList.ItemsSource = allFiles;
+            LargestFilesList.ItemsSource = files;
+        }
+
+        private void UpdateLargestFolders(DirectoryNode root)
+        {
+            if (root == null) return;
+
+            var folders = GetAllFolders(root, 50000)
+                .Where(f => f != null && PassesActiveFilters(f))
+                .OrderByDescending(f => f.Size)
+                .Take(_topItemsCount)
+                .Select(f => new { Name = f.Name ?? "Unknown", Path = f.Path ?? "", Size = FormatBytes(f.Size), Node = f })
+                .ToList();
+
+            LargestFoldersList.ItemsSource = folders;
         }
 
         private void FindDuplicates(DirectoryNode root)
@@ -486,6 +473,208 @@ namespace Fyle
             };
         }
 
+        private List<DirectoryNode> GetAllFolders(DirectoryNode node, int maxFolders = 50000)
+        {
+            var folders = new List<DirectoryNode>();
+            CollectFolders(node, folders, maxFolders);
+            return folders;
+        }
+
+        private void CollectFolders(DirectoryNode node, List<DirectoryNode> folders, int maxFolders)
+        {
+            if (node?.Children == null || folders.Count >= maxFolders) return;
+
+            foreach (var child in node.Children)
+            {
+                if (folders.Count >= maxFolders) break;
+                if (child == null) continue;
+                if (child.IsDirectory)
+                {
+                    folders.Add(child);
+                    CollectFolders(child, folders, maxFolders);
+                }
+            }
+        }
+
+        private bool PassesActiveFilters(DirectoryNode node)
+        {
+            if (node == null) return false;
+            if (IsExcluded(node.Path)) return false;
+
+            var filterIndex = FileTypeFilter?.SelectedIndex ?? 0;
+            var q = (SearchBox?.Text ?? "").Trim();
+            var ownerFilter = GetOwnerFilterValue();
+
+            if (node.IsDirectory)
+            {
+                if (filterIndex == 1)
+                {
+                    return q.Length == 0 || NameOrPathMatches(node, q);
+                }
+
+                var fileFiltersActive = filterIndex > 1 || !string.IsNullOrWhiteSpace(ownerFilter) || _scanMinFileSizeBytes > 0;
+                if (!fileFiltersActive)
+                {
+                    if (q.Length == 0) return true;
+                    return NameOrPathMatches(node, q);
+                }
+
+                if (q.Length > 0 && NameOrPathMatches(node, q) && filterIndex <= 1 && string.IsNullOrWhiteSpace(ownerFilter) && _scanMinFileSizeBytes <= 0)
+                    return true;
+
+                return DirectoryHasMatchingFileDescendant(node, filterIndex, ownerFilter, q);
+            }
+
+            return PassesActiveFiltersForFile(node, filterIndex, ownerFilter, q);
+        }
+
+        private bool PassesActiveFiltersForFile(DirectoryNode node, int filterIndex, string ownerFilter, string q)
+        {
+            if (node == null) return false;
+            if (node.IsDirectory) return false;
+            if (IsExcluded(node.Path)) return false;
+
+            if (!_scanIncludeFiles) return false;
+            if (_scanMinFileSizeBytes > 0 && node.Size < _scanMinFileSizeBytes) return false;
+
+            if (filterIndex == 1) return false;
+            if (filterIndex > 1)
+            {
+                if (!CategoryMatchesFilterIndex(node.Name ?? "", filterIndex)) return false;
+            }
+
+            if (!string.IsNullOrWhiteSpace(ownerFilter))
+            {
+                if (!OwnerMatches(node, ownerFilter)) return false;
+            }
+
+            if (q.Length > 0)
+            {
+                if (!NameOrPathMatches(node, q)) return false;
+            }
+
+            return true;
+        }
+
+        private static bool NameOrPathMatches(DirectoryNode node, string q)
+        {
+            if (string.IsNullOrWhiteSpace(q)) return true;
+            var name = node.Name ?? "";
+            var path = node.Path ?? "";
+            return name.Contains(q, StringComparison.OrdinalIgnoreCase) || path.Contains(q, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private bool DirectoryHasMatchingFileDescendant(DirectoryNode node, int filterIndex, string ownerFilter, string q)
+        {
+            const int maxDepth = 4;
+            const int maxVisited = 2500;
+            int visited = 0;
+
+            var stack = new Stack<(DirectoryNode Node, int Depth)>();
+            stack.Push((node, 0));
+
+            while (stack.Count > 0)
+            {
+                var (current, depth) = stack.Pop();
+                if (current == null) continue;
+                if (visited++ > maxVisited) return true;
+                if (IsExcluded(current.Path)) continue;
+                if (current.Children == null || current.Children.Count == 0) continue;
+
+                foreach (var child in current.Children)
+                {
+                    if (child == null) continue;
+                    if (IsExcluded(child.Path)) continue;
+
+                    if (child.IsDirectory)
+                    {
+                        if (depth < maxDepth) stack.Push((child, depth + 1));
+                        continue;
+                    }
+
+                    if (PassesActiveFiltersForFile(child, filterIndex, ownerFilter, q)) return true;
+                }
+            }
+
+            return false;
+        }
+
+        private string GetOwnerFilterValue()
+        {
+            if (OwnerFilter?.SelectedValue is string selectedValue) return selectedValue;
+            if (OwnerFilter?.SelectedItem is OwnerOption opt) return opt.Value;
+            return _ownerFilter;
+        }
+
+        private bool OwnerMatches(DirectoryNode node, string ownerFilter)
+        {
+            if (string.IsNullOrWhiteSpace(ownerFilter)) return true;
+            if (string.IsNullOrWhiteSpace(node.Path)) return false;
+            var owner = GetOwnerCached(node.Path, node.IsDirectory);
+            return string.Equals(owner, ownerFilter, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private string GetOwnerCached(string path, bool isDirectory)
+        {
+            if (_ownerCache.TryGetValue(path, out var cached)) return cached;
+            var owner = GetOwner(path, isDirectory);
+            _ownerCache[path] = owner;
+            return owner;
+        }
+
+        private static string GetOwner(string path, bool isDirectory)
+        {
+            try
+            {
+                IdentityReference? identity;
+                if (isDirectory)
+                {
+                    var acl = new DirectoryInfo(path).GetAccessControl();
+                    identity = acl.GetOwner(typeof(NTAccount));
+                }
+                else
+                {
+                    var acl = new FileInfo(path).GetAccessControl();
+                    identity = acl.GetOwner(typeof(NTAccount));
+                }
+                return identity?.Value ?? "";
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        private bool CategoryMatchesFilterIndex(string fileName, int filterIndex)
+        {
+            var ext = Path.GetExtension(fileName).ToLowerInvariant();
+            return filterIndex switch
+            {
+                2 => ext is ".mp4" or ".mkv" or ".avi" or ".mov" or ".wmv" or ".flv" or ".webm" or ".m4v",
+                3 => ext is ".jpg" or ".jpeg" or ".png" or ".gif" or ".bmp" or ".svg" or ".webp" or ".ico" or ".tiff",
+                4 => ext is ".mp3" or ".wav" or ".flac" or ".aac" or ".ogg" or ".wma" or ".m4a",
+                5 => ext is ".pdf" or ".doc" or ".docx" or ".xls" or ".xlsx" or ".ppt" or ".pptx" or ".txt" or ".rtf" or ".odt",
+                6 => ext is ".zip" or ".rar" or ".7z" or ".tar" or ".gz" or ".bz2" or ".xz",
+                7 => ext is ".exe" or ".msi" or ".dll",
+                _ => true
+            };
+        }
+
+        private bool IsExcluded(string? path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return false;
+            if (_excludedPaths.Count == 0) return false;
+
+            var normalized = path.Trim().TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            foreach (var ex in _excludedPaths)
+            {
+                if (normalized.Equals(ex, StringComparison.OrdinalIgnoreCase)) return true;
+                if (normalized.StartsWith(ex + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) return true;
+                if (normalized.StartsWith(ex + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+
         private async void DriveListBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
             if (DriveListBox.SelectedItem == null) return;
@@ -514,12 +703,23 @@ namespace Fyle
         private async System.Threading.Tasks.Task ScanDrive(string drivePath)
         {
             _currentDrive = drivePath;
+            _scanCts?.Cancel();
+            _scanCts?.Dispose();
+            _scanCts = new CancellationTokenSource();
+            _mftScanner = null;
+            _scanUsedMft = false;
+            Interlocked.Exchange(ref _lastPathUpdateStamp, 0);
+            Interlocked.Exchange(ref _lastProgressUpdateStamp, 0);
+
             _scanTimer.Restart();
             CurrentPathText.Text = "Starting scan...";
             StatusText.Text = "Initializing...";
             ScanProgressBar.Visibility = Visibility.Visible;
             ScanProgressBar.Value = 0;
             CancelButton.Visibility = Visibility.Visible;
+            CancelButton.Content = "✕ Cancel";
+            PauseButton.Visibility = Visibility.Visible;
+            PauseButton.Content = "⏸ Pause";
             ProgressText.Text = "0%";
             RescanButton.IsEnabled = false;
             SettingsExportButton.IsEnabled = false;
@@ -531,78 +731,62 @@ namespace Fyle
             LargestFilesList.ItemsSource = null;
             LargestFoldersList.ItemsSource = null;
             DuplicateFilesList.ItemsSource = null;
+            _ownerCache.Clear();
 
             try
             {
                 DirectoryNode? root = null;
+                var options = CreateScanOptions();
                 
                 // Try MFT scanning if enabled
                 if (_useMftScanning && MftScanner.IsMftAvailable(drivePath))
                 {
+                    _scanUsedMft = true;
                     StatusText.Text = "⚡ MFT Fast Scan mode...";
-                    var mftScanner = new MftScanner();
+                    _mftScanner = new MftScanner();
                     
-                    mftScanner.StatusChanged += status => Dispatcher.Invoke(() => StatusText.Text = $"⚡ {status}");
-                    mftScanner.ProgressChanged += progress => Dispatcher.Invoke(() => 
+                    _mftScanner.StatusChanged += status =>
                     {
-                        ScanProgressBar.Value = progress;
-                        ProgressText.Text = $"{progress}%";
-                    });
+                        var now = Stopwatch.GetTimestamp();
+                        var last = Interlocked.Read(ref _lastPathUpdateStamp);
+                        if (now - last < Stopwatch.Frequency / 8) return;
+                        Interlocked.Exchange(ref _lastPathUpdateStamp, now);
+                        Dispatcher.BeginInvoke(() => StatusText.Text = $"⚡ {status}");
+                    };
+
+                    _mftScanner.ProgressChanged += progress =>
+                    {
+                        var now = Stopwatch.GetTimestamp();
+                        var last = Interlocked.Read(ref _lastProgressUpdateStamp);
+                        if (now - last < Stopwatch.Frequency / 10 && progress < 99) return;
+                        Interlocked.Exchange(ref _lastProgressUpdateStamp, now);
+                        Dispatcher.BeginInvoke(() =>
+                        {
+                            ScanProgressBar.Value = progress;
+                            ProgressText.Text = $"{progress}% • {_scanTimer.Elapsed:mm\\:ss}";
+                        });
+                    };
                     
-                    root = await mftScanner.ScanDriveAsync(drivePath);
+                    root = await _mftScanner.ScanDriveAsync(drivePath, options, _scanCts.Token);
                     
                     if (root == null)
                     {
                         // MFT scan failed, fall back to standard
+                        _scanUsedMft = false;
+                        _mftScanner = null;
                         StatusText.Text = "MFT unavailable, using standard scan...";
-                        root = await _scanner.ScanDriveAsync(drivePath);
+                        root = await _scanner.ScanDriveAsync(drivePath, options, _scanCts.Token);
                     }
                 }
                 else
                 {
                     // Standard scanning
-                    root = await _scanner.ScanDriveAsync(drivePath);
+                    root = await _scanner.ScanDriveAsync(drivePath, options, _scanCts.Token);
                 }
                 
                 if (root != null)
                 {
-                    _currentRoot = root;
-                    
-                    // Display the results (same as ScanCompleted handler)
-                    _scanTimer.Stop();
-                    Log($"MFT Scan complete - displaying node: {root.Name}, children: {root.Children.Count}");
-                    
-                    TreemapViewControl.DisplayNode(root, root);
-                    
-                    ScanProgressBar.Visibility = Visibility.Collapsed;
-                    CancelButton.Visibility = Visibility.Collapsed;
-                    ProgressText.Text = "";
-                    RescanButton.IsEnabled = true;
-                    SettingsExportButton.IsEnabled = true;
-                    BackButton.IsEnabled = false;
-                    
-                    UpdateBreadcrumb();
-                    UpdateStats(root);
-                    
-                    try { UpdateFileTypeStats(root); } catch (Exception ex) { LogError("UpdateFileTypeStats", ex); }
-                    try { UpdateLargestFiles(root); } catch (Exception ex) { LogError("UpdateLargestFiles", ex); }
-                    try { UpdateStatistics(); } catch (Exception ex) { LogError("UpdateStatistics", ex); }
-                    try { FindDuplicates(root); } catch (Exception ex) { LogError("FindDuplicates", ex); }
-                    
-                    if (!string.IsNullOrEmpty(_currentDrive) && !_recentScans.Contains(_currentDrive))
-                    {
-                        _recentScans.Insert(0, _currentDrive);
-                        if (_recentScans.Count > 5)
-                            _recentScans.RemoveAt(5);
-                        RecentScansListBox.ItemsSource = _recentScans.ToList();
-                    }
-                    
-                    ScanTimeText.Text = $"⏱ {_scanTimer.Elapsed:mm\\:ss}";
-                    StatusText.Text = $"⚡ MFT Scan complete • {root.Children.Count} items found";
-                    SettingsSaveScanButton.IsEnabled = true;
-                    
-                    // Start watching for changes
-                    SetupFileWatcher(drivePath);
+                    ProcessScanResult(root);
                 }
             }
             catch (OperationCanceledException)
@@ -610,6 +794,7 @@ namespace Fyle
                 StatusText.Text = "Scan cancelled";
                 ScanProgressBar.Visibility = Visibility.Collapsed;
                 CancelButton.Visibility = Visibility.Collapsed;
+                PauseButton.Visibility = Visibility.Collapsed;
                 RescanButton.IsEnabled = true;
             }
             catch (Exception ex)
@@ -618,9 +803,92 @@ namespace Fyle
                 MessageBox.Show($"Error scanning drive: {ex.Message}", "Scan Error", MessageBoxButton.OK, MessageBoxImage.Error);
                 ScanProgressBar.Visibility = Visibility.Collapsed;
                 CancelButton.Visibility = Visibility.Collapsed;
+                PauseButton.Visibility = Visibility.Collapsed;
                 RescanButton.IsEnabled = true;
                 StatusText.Text = "Scan failed";
             }
+            finally
+            {
+                _mftScanner = null;
+                _scanUsedMft = false;
+                _scanCts?.Dispose();
+                _scanCts = null;
+            }
+        }
+
+        private Scanner.ScanOptions CreateScanOptions()
+        {
+            return new Scanner.ScanOptions
+            {
+                IncludeHidden = _scanIncludeHidden,
+                IncludeSystem = _scanIncludeSystem,
+                IncludeFiles = _scanIncludeFiles,
+                MinFileSizeBytes = _scanMinFileSizeBytes,
+                ExcludedPaths = _excludedPaths.ToList()
+            };
+        }
+
+        private ExportService.ExportMetadata CreateExportMetadata()
+        {
+            var asm = Assembly.GetExecutingAssembly().GetName();
+            var version = asm.Version?.ToString() ?? "";
+
+            return new ExportService.ExportMetadata
+            {
+                AppVersion = version,
+                ExportedAtUtc = DateTime.UtcNow,
+                ScanTargetPath = _currentDrive ?? _currentRoot?.Path ?? "",
+                UsedMft = _scanUsedMft,
+                FilterText = (SearchBox?.Text ?? "").Trim(),
+                FileTypeFilterIndex = FileTypeFilter?.SelectedIndex ?? 0,
+                IncludeHidden = _scanIncludeHidden,
+                IncludeSystem = _scanIncludeSystem,
+                IncludeFiles = _scanIncludeFiles,
+                MinFileSizeBytes = _scanMinFileSizeBytes,
+                ExcludedPaths = _excludedPaths.ToList()
+            };
+        }
+
+        private void ProcessScanResult(DirectoryNode root)
+        {
+            _scanTimer.Stop();
+            _currentRoot = root;
+
+            TreemapViewControl.SetColorMode(_colorMode);
+            ApplyFiltersToTreemap();
+            TreemapViewControl.DisplayNode(root, root);
+
+            ScanProgressBar.Visibility = Visibility.Collapsed;
+            CancelButton.Visibility = Visibility.Collapsed;
+            PauseButton.Visibility = Visibility.Collapsed;
+            ProgressText.Text = "";
+            RescanButton.IsEnabled = true;
+            SettingsExportButton.IsEnabled = true;
+            BackButton.IsEnabled = false;
+
+            UpdateBreadcrumb();
+            UpdateStats(root);
+            UpdateOwnerFilterOptions(root);
+
+            try { UpdateFileTypeStats(root); } catch (Exception ex) { LogError("UpdateFileTypeStats", ex); }
+            try { UpdateLargestFiles(root); } catch (Exception ex) { LogError("UpdateLargestFiles", ex); }
+            try { UpdateStatistics(); } catch (Exception ex) { LogError("UpdateStatistics", ex); }
+            try { FindDuplicates(root); } catch (Exception ex) { LogError("FindDuplicates", ex); }
+
+            if (!string.IsNullOrEmpty(_currentDrive) && !_recentScans.Contains(_currentDrive))
+            {
+                _recentScans.Insert(0, _currentDrive);
+                if (_recentScans.Count > 5)
+                    _recentScans.RemoveAt(5);
+                RecentScansListBox.ItemsSource = _recentScans.ToList();
+            }
+
+            ScanTimeText.Text = $"⏱ {_scanTimer.Elapsed:mm\\:ss}";
+            StatusText.Text = _scanUsedMft ? $"⚡ MFT Scan complete • {root.Children.Count} items found" : $"Scan complete • {root.Children.Count} items found";
+            SettingsSaveScanButton.IsEnabled = true;
+
+            SetupFileWatcher(_currentDrive ?? "");
+            SaveSettings();
         }
 
         private void RecentScansListBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -653,8 +921,38 @@ namespace Fyle
 
         private void CancelButton_Click(object sender, RoutedEventArgs e)
         {
+            if (_exportCts != null)
+            {
+                _exportCts.Cancel();
+                StatusText.Text = "Cancelling export...";
+                return;
+            }
+
+            _scanCts?.Cancel();
+            _mftScanner?.Cancel();
             _scanner.Cancel();
             StatusText.Text = "Cancelling...";
+        }
+
+        private void PauseButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_scanCts == null) return;
+
+            bool isPaused = _mftScanner != null ? _mftScanner.IsPaused : _scanner.IsPaused;
+            if (isPaused)
+            {
+                _mftScanner?.Resume();
+                _scanner.Resume();
+                PauseButton.Content = "⏸ Pause";
+                StatusText.Text = "Resuming...";
+            }
+            else
+            {
+                _mftScanner?.Pause();
+                _scanner.Pause();
+                PauseButton.Content = "▶ Resume";
+                StatusText.Text = "Paused";
+            }
         }
 
         private void BackButton_Click(object sender, RoutedEventArgs e)
@@ -677,7 +975,7 @@ namespace Fyle
             }
         }
 
-        private void ExportButton_Click(object sender, RoutedEventArgs e)
+        private async void ExportButton_Click(object sender, RoutedEventArgs e)
         {
             if (_currentRoot == null) return;
 
@@ -689,26 +987,39 @@ namespace Fyle
 
             if (dialog.ShowDialog() == true)
             {
+                _exportCts?.Cancel();
+                _exportCts?.Dispose();
+                _exportCts = new CancellationTokenSource();
+
                 try
                 {
                     StatusText.Text = "Exporting...";
+                    SettingsExportButton.IsEnabled = false;
+                    CancelButton.Visibility = Visibility.Visible;
+                    CancelButton.Content = "✕ Cancel Export";
+                    PauseButton.Visibility = Visibility.Collapsed;
                     
                     var ext = System.IO.Path.GetExtension(dialog.FileName).ToLower();
-                    switch (ext)
+                    var metadata = CreateExportMetadata();
+
+                    await Task.Run(() =>
                     {
-                        case ".csv":
-                            ExportService.ExportToCsv(_currentRoot, dialog.FileName);
-                            break;
-                        case ".json":
-                            ExportService.ExportToJson(_currentRoot, dialog.FileName);
-                            break;
-                        case ".html":
-                            ExportService.ExportToHtml(_currentRoot, dialog.FileName, $"Fyle Report - {_currentDrive}");
-                            break;
-                        case ".xml":
-                            ExportService.ExportToXml(_currentRoot, dialog.FileName);
-                            break;
-                    }
+                        switch (ext)
+                        {
+                            case ".csv":
+                                ExportService.ExportToCsv(_currentRoot, dialog.FileName, metadata, _exportCts.Token);
+                                break;
+                            case ".json":
+                                ExportService.ExportToJson(_currentRoot, dialog.FileName, metadata, _exportCts.Token);
+                                break;
+                            case ".html":
+                                ExportService.ExportToHtml(_currentRoot, dialog.FileName, $"Fyle Report - {_currentDrive}", metadata, _exportCts.Token);
+                                break;
+                            case ".xml":
+                                ExportService.ExportToXml(_currentRoot, dialog.FileName, metadata, _exportCts.Token);
+                                break;
+                        }
+                    }, _exportCts.Token);
                     
                     StatusText.Text = "Export completed!";
                     
@@ -720,10 +1031,22 @@ namespace Fyle
                         Process.Start(new ProcessStartInfo { FileName = dialog.FileName, UseShellExecute = true });
                     }
                 }
+                catch (OperationCanceledException)
+                {
+                    StatusText.Text = "Export cancelled";
+                }
                 catch (Exception ex)
                 {
                     MessageBox.Show($"Export failed: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
                     StatusText.Text = "Export failed";
+                }
+                finally
+                {
+                    _exportCts?.Dispose();
+                    _exportCts = null;
+                    CancelButton.Content = "✕ Cancel";
+                    CancelButton.Visibility = Visibility.Collapsed;
+                    SettingsExportButton.IsEnabled = true;
                 }
             }
         }
@@ -750,6 +1073,60 @@ namespace Fyle
                 catch (Exception ex)
                 {
                     MessageBox.Show($"Save failed: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                }
+            }
+        }
+
+        private void OpenScanButton_Click(object sender, RoutedEventArgs e)
+        {
+            var dialog = new OpenFileDialog
+            {
+                Filter = "Fyle Scan|*.fylescan",
+                Title = "Open a saved scan"
+            };
+
+            if (dialog.ShowDialog() == true)
+            {
+                try
+                {
+                    var scan = ScanDataManager.LoadScan(dialog.FileName);
+                    if (scan == null)
+                    {
+                        MessageBox.Show("Could not load scan file.", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                        return;
+                    }
+
+                    var sb = new System.Text.StringBuilder();
+                    sb.AppendLine("📂 SAVED SCAN");
+                    sb.AppendLine($"Scan date: {scan.ScanDate:yyyy-MM-dd HH:mm}");
+                    sb.AppendLine($"Drive: {scan.DrivePath}");
+                    sb.AppendLine();
+                    sb.AppendLine($"Total size: {FormatBytes(scan.TotalSize)}");
+                    sb.AppendLine($"Files: {scan.TotalFiles:N0}");
+                    sb.AppendLine($"Folders: {scan.TotalFolders:N0}");
+                    sb.AppendLine();
+
+                    if (scan.Folders != null && scan.Folders.Count > 0)
+                    {
+                        sb.AppendLine("TOP FOLDERS (snapshot):");
+                        sb.AppendLine();
+
+                        foreach (var folder in scan.Folders.OrderByDescending(f => f.Size).Take(20))
+                        {
+                            sb.AppendLine($"• {folder.Name}  {FormatBytes(folder.Size)}  ({folder.FileCount:N0} files)");
+                            sb.AppendLine($"  {folder.Path}");
+                        }
+                    }
+                    else
+                    {
+                        sb.AppendLine("No folder snapshot data found in this scan file.");
+                    }
+
+                    MessageBox.Show(sb.ToString(), "Saved Scan", MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show($"Open failed: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
                 }
             }
         }
@@ -1007,21 +1384,198 @@ namespace Fyle
 
         private void SearchBox_TextChanged(object sender, TextChangedEventArgs e)
         {
-            // Filter is applied in real-time via treemap
-            // Could implement search highlighting here
+            ApplyFiltersAndRefreshViews();
         }
 
         private void FileTypeFilter_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
             if (FileTypeFilter == null) return;
-            // Apply filter to treemap view
-            // This would require extending the treemap to support filtering
+            ApplyFiltersAndRefreshViews();
+        }
+
+        private void OwnerFilter_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (OwnerFilter == null) return;
+            _ownerFilter = GetOwnerFilterValue();
+            ApplyFiltersAndRefreshViews();
         }
 
         private void ClearFilterButton_Click(object sender, RoutedEventArgs e)
         {
             SearchBox.Text = "";
             FileTypeFilter.SelectedIndex = 0;
+            _ownerFilter = "";
+            if (OwnerFilter != null) OwnerFilter.SelectedValue = "";
+            ApplyFiltersAndRefreshViews();
+        }
+
+        private void ExportFilteredButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_currentRoot == null) return;
+
+            var baseNode = TreemapViewControl?.CurrentNode ?? _currentRoot;
+            if (baseNode == null) return;
+
+            var dialog = new SaveFileDialog
+            {
+                Filter = "CSV File|*.csv",
+                FileName = $"Fyle_Export_{DateTime.Now:yyyyMMdd_HHmmss}.csv"
+            };
+
+            if (dialog.ShowDialog() != true) return;
+
+            try
+            {
+                var filePath = dialog.FileName;
+                var maxFiles = 100000;
+                var maxFolders = 100000;
+
+                var files = GetAllFiles(baseNode, maxFiles).Where(n => n != null && PassesActiveFilters(n)).ToList();
+                var folders = GetAllFolders(baseNode, maxFolders).Where(n => n != null && PassesActiveFilters(n)).ToList();
+
+                var all = folders.Concat(files).OrderByDescending(n => n.Size).ToList();
+
+                using (var writer = new StreamWriter(filePath, false, Encoding.UTF8))
+                {
+                    writer.WriteLine("Path,Name,IsDirectory,SizeBytes,Size,Owner,Created,Modified,Accessed");
+                    foreach (var n in all)
+                    {
+                        var path = n.Path ?? "";
+                        var name = n.Name ?? "";
+                        var owner = string.IsNullOrWhiteSpace(path) ? "" : GetOwnerCached(path, n.IsDirectory);
+                        var created = GetCreationTimeSafe(path, n.IsDirectory);
+                        var modified = GetLastWriteTimeSafe(path, n.IsDirectory);
+                        var accessed = GetLastAccessTimeSafe(path, n.IsDirectory);
+
+                        writer.WriteLine(
+                            $"{EscapeCsv(path)}," +
+                            $"{EscapeCsv(name)}," +
+                            $"{(n.IsDirectory ? "true" : "false")}," +
+                            $"{n.Size}," +
+                            $"{EscapeCsv(FormatBytes(n.Size))}," +
+                            $"{EscapeCsv(owner)}," +
+                            $"{EscapeCsv(FormatDateTime(created))}," +
+                            $"{EscapeCsv(FormatDateTime(modified))}," +
+                            $"{EscapeCsv(FormatDateTime(accessed))}");
+                    }
+                }
+
+                StatusText.Text = $"Exported {all.Count:N0} item(s)";
+                Clipboard.SetText(filePath);
+            }
+            catch (Exception ex)
+            {
+                LogError("ExportFilteredButton_Click", ex);
+                MessageBox.Show($"Export failed: {ex.Message}", "Export Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private static string EscapeCsv(string value)
+        {
+            value ??= "";
+            if (value.Contains('"') || value.Contains(',') || value.Contains('\n') || value.Contains('\r'))
+            {
+                return "\"" + value.Replace("\"", "\"\"") + "\"";
+            }
+            return value;
+        }
+
+        private static string FormatDateTime(DateTime dt)
+        {
+            if (dt == DateTime.MinValue || dt == DateTime.MaxValue) return "";
+            return dt.ToString("yyyy-MM-dd HH:mm");
+        }
+
+        private static DateTime GetLastWriteTimeSafe(string path, bool isDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return DateTime.MinValue;
+            try { return isDirectory ? Directory.GetLastWriteTime(path) : File.GetLastWriteTime(path); } catch { return DateTime.MinValue; }
+        }
+
+        private static DateTime GetCreationTimeSafe(string path, bool isDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return DateTime.MinValue;
+            try { return isDirectory ? Directory.GetCreationTime(path) : File.GetCreationTime(path); } catch { return DateTime.MinValue; }
+        }
+
+        private static DateTime GetLastAccessTimeSafe(string path, bool isDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return DateTime.MinValue;
+            try { return isDirectory ? Directory.GetLastAccessTime(path) : File.GetLastAccessTime(path); } catch { return DateTime.MinValue; }
+        }
+
+        private void ApplyFiltersToTreemap()
+        {
+            TreemapViewControl.SetFilter(
+                SearchBox?.Text,
+                FileTypeFilter?.SelectedIndex ?? 0,
+                _scanMinFileSizeBytes,
+                _scanIncludeFiles,
+                GetOwnerFilterValue(),
+                _excludedPaths,
+                _maxItemsToRender);
+        }
+
+        private void ApplyFiltersAndRefreshViews()
+        {
+            if (TreemapViewControl == null) return;
+
+            ApplyFiltersToTreemap();
+
+            var root = _currentRoot;
+            var current = TreemapViewControl.CurrentNode ?? root;
+            if (root != null && current != null)
+            {
+                TreemapViewControl.DisplayNode(current, root);
+                UpdateStats(root);
+                UpdateCurrentNodePanels(current);
+            }
+
+            if (SunburstViewRadio?.IsChecked == true) UpdateSunburstView();
+            if (ListViewRadio?.IsChecked == true) UpdateListView();
+
+            if (!_isLoadingSettings) SaveSettings();
+        }
+
+        private void UpdateCurrentNodePanels(DirectoryNode node)
+        {
+            try { UpdateLargestFiles(node); } catch (Exception ex) { LogError("UpdateLargestFiles(current)", ex); }
+            try { UpdateLargestFolders(node); } catch (Exception ex) { LogError("UpdateLargestFolders(current)", ex); }
+            try { UpdateStatistics(); } catch (Exception ex) { LogError("UpdateStatistics", ex); }
+        }
+
+        private void UpdateOwnerFilterOptions(DirectoryNode node)
+        {
+            if (OwnerFilter == null) return;
+
+            var previous = GetOwnerFilterValue();
+            var candidates = node.Children?.Where(c => c != null && !IsExcluded(c.Path) && !string.IsNullOrWhiteSpace(c.Path)).Take(1500).ToList() ?? new List<DirectoryNode>();
+
+            var groups = candidates
+                .Select(c => new { Node = c, Owner = GetOwnerCached(c.Path ?? "", c.IsDirectory) })
+                .Where(x => !string.IsNullOrWhiteSpace(x.Owner))
+                .GroupBy(x => x.Owner, StringComparer.OrdinalIgnoreCase)
+                .Select(g => new { Owner = g.Key, Size = g.Sum(x => x.Node.Size) })
+                .OrderByDescending(x => x.Size)
+                .Take(40)
+                .ToList();
+
+            var options = new List<OwnerOption>
+            {
+                new OwnerOption { Display = "All Owners", Value = "" }
+            };
+
+            foreach (var g in groups)
+            {
+                options.Add(new OwnerOption { Display = $"{g.Owner} • {FormatBytes(g.Size)}", Value = g.Owner });
+            }
+
+            OwnerFilter.ItemsSource = options;
+
+            var desired = !string.IsNullOrWhiteSpace(_pendingOwnerFilter) ? _pendingOwnerFilter : previous;
+            _pendingOwnerFilter = "";
+            OwnerFilter.SelectedValue = desired;
+            _ownerFilter = desired;
         }
 
         private void ColorModeCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -1303,12 +1857,219 @@ namespace Fyle
             }
         }
 
+        private void StatsItem_ContextMenuOpening(object sender, ContextMenuEventArgs e)
+        {
+            if (sender is not FrameworkElement element) return;
+            if (element.DataContext == null) return;
+
+            string path = "";
+            string name = "";
+            DirectoryNode? node = null;
+
+            try
+            {
+                dynamic data = element.DataContext;
+                try { path = data.Path as string ?? data.Path; } catch { }
+                try { name = data.Name as string ?? data.Name; } catch { }
+                try { node = data.Node as DirectoryNode; } catch { }
+            }
+            catch { }
+
+            if (node == null && !string.IsNullOrWhiteSpace(path) && _currentRoot != null)
+            {
+                node = FindNodeByPath(_currentRoot, path);
+            }
+
+            if (node != null)
+            {
+                path = node.Path;
+                name = node.Name;
+            }
+
+            if (string.IsNullOrWhiteSpace(path)) return;
+            if (string.IsNullOrWhiteSpace(name)) name = System.IO.Path.GetFileName(path);
+
+            bool isDirectory = node?.IsDirectory == true || Directory.Exists(path);
+            element.ContextMenu = BuildStatsItemContextMenu(node, path, name, isDirectory);
+        }
+
+        private ContextMenu BuildStatsItemContextMenu(DirectoryNode? node, string path, string name, bool isDirectory)
+        {
+            var menu = new ContextMenu();
+
+            if (isDirectory)
+            {
+                var openItem = new MenuItem { Header = "📂 Open in Explorer" };
+                openItem.Click += (s, e) => OpenPath(path);
+                menu.Items.Add(openItem);
+
+                if (node != null && _currentRoot != null)
+                {
+                    var zoomItem = new MenuItem { Header = "🔍 Zoom Into Folder" };
+                    zoomItem.Click += (s, e) =>
+                    {
+                        TreemapViewControl.DisplayNode(node, _currentRoot);
+                        UpdateBreadcrumb();
+                        BackButton.IsEnabled = TreemapViewControl.CanGoBack();
+                    };
+                    menu.Items.Add(zoomItem);
+                }
+
+                var excludeItem = new MenuItem { Header = "🚫 Exclude Folder" };
+                excludeItem.Click += (s, e) => ExcludePath(path);
+                menu.Items.Add(excludeItem);
+            }
+            else
+            {
+                var openFileItem = new MenuItem { Header = "📄 Open File" };
+                openFileItem.Click += (s, e) => OpenPath(path);
+                menu.Items.Add(openFileItem);
+            }
+
+            menu.Items.Add(new Separator());
+
+            var showItem = new MenuItem { Header = "📍 Show in Explorer" };
+            showItem.Click += (s, e) => ShowInExplorer(path);
+            menu.Items.Add(showItem);
+
+            var copyPathItem = new MenuItem { Header = "📋 Copy Path" };
+            copyPathItem.Click += (s, e) => Clipboard.SetText(path);
+            menu.Items.Add(copyPathItem);
+
+            var copyNameItem = new MenuItem { Header = "📝 Copy Name" };
+            copyNameItem.Click += (s, e) => Clipboard.SetText(name);
+            menu.Items.Add(copyNameItem);
+
+            menu.Items.Add(new Separator());
+
+            var propsItem = new MenuItem { Header = "ℹ️ Properties" };
+            propsItem.Click += (s, e) =>
+            {
+                try { Fyle.UI.NativeMethods.ShowFileProperties(path); } catch { }
+            };
+            menu.Items.Add(propsItem);
+
+            menu.Items.Add(new Separator());
+
+            var deleteItem = new MenuItem
+            {
+                Header = "🗑️ Delete (Recycle Bin)",
+                Foreground = new SolidColorBrush(Color.FromRgb(248, 113, 113))
+            };
+            deleteItem.Click += (s, e) => DeletePathFromStats(node, path, name, isDirectory);
+            menu.Items.Add(deleteItem);
+
+            return menu;
+        }
+
+        private void OpenPath(string path)
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo { FileName = path, UseShellExecute = true });
+            }
+            catch { }
+        }
+
+        private void ShowInExplorer(string path)
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "explorer.exe",
+                    Arguments = $"/select,\"{path}\"",
+                    UseShellExecute = true
+                });
+            }
+            catch { }
+        }
+
+        private void DeletePathFromStats(DirectoryNode? node, string path, string name, bool isDirectory)
+        {
+            var result = MessageBox.Show(
+                $"Move to Recycle Bin?\n\n{path}",
+                "Confirm Delete",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning);
+
+            if (result != MessageBoxResult.Yes) return;
+
+            try
+            {
+                if (isDirectory)
+                    FileSystem.DeleteDirectory(path, UIOption.OnlyErrorDialogs, RecycleOption.SendToRecycleBin);
+                else
+                    FileSystem.DeleteFile(path, UIOption.OnlyErrorDialogs, RecycleOption.SendToRecycleBin);
+
+                if (_currentRoot != null)
+                {
+                    node ??= FindNodeByPath(_currentRoot, path);
+                    if (node != null)
+                        RemoveNodeFromTree(node);
+                }
+
+                RefreshAfterTreeMutation();
+                StatusText.Text = $"Deleted: {name}";
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Could not delete: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private void RemoveNodeFromTree(DirectoryNode node)
+        {
+            var parent = node.Parent;
+            if (parent != null)
+            {
+                parent.Children.Remove(node);
+            }
+
+            long sizeDelta = node.Size;
+            int fileDelta = node.IsDirectory ? node.FileCount : 1;
+            int dirDelta = node.IsDirectory ? node.DirectoryCount + 1 : 0;
+
+            while (parent != null)
+            {
+                parent.Size = Math.Max(0, parent.Size - sizeDelta);
+                parent.FileCount = Math.Max(0, parent.FileCount - fileDelta);
+                parent.DirectoryCount = Math.Max(0, parent.DirectoryCount - dirDelta);
+                parent = parent.Parent;
+            }
+        }
+
+        private void RefreshAfterTreeMutation()
+        {
+            if (_currentRoot == null) return;
+
+            ApplyFiltersToTreemap();
+
+            var current = TreemapViewControl?.CurrentNode ?? _currentRoot;
+            TreemapViewControl?.DisplayNode(current, _currentRoot);
+            UpdateBreadcrumb();
+            UpdateStats(_currentRoot);
+
+            try { UpdateFileTypeStats(_currentRoot); } catch (Exception ex) { LogError("UpdateFileTypeStats(refresh)", ex); }
+            try { UpdateStatistics(); } catch (Exception ex) { LogError("UpdateStatistics(refresh)", ex); }
+        }
+
         private void TreemapViewControl_NodeSelected(DirectoryNode node)
         {
             UpdateBreadcrumb();
             BackButton.IsEnabled = TreemapViewControl.CanGoBack();
             ItemCountText.Text = $"{node.Children.Count} items • {TreemapViewControl.VisibleItemCount} visible";
             StatusText.Text = $"Viewing: {node.Name} ({node.FormattedSize})";
+            UpdateOwnerFilterOptions(node);
+            UpdateCurrentNodePanels(node);
+
+            if (ChartTypeCombo?.SelectedIndex == 1)
+            {
+                DrawPieChart();
+            }
+
+            if (SunburstViewRadio?.IsChecked == true) UpdateSunburstView();
+            if (ListViewRadio?.IsChecked == true) UpdateListView();
         }
 
         private void UpdateBreadcrumb()
@@ -1326,6 +2087,13 @@ namespace Fyle
             SettingsOverlay.Visibility = Visibility.Visible;
             DarkModeToggle.IsChecked = _isDarkMode;
             MftModeToggle.IsChecked = _useMftScanning;
+            AutoRefreshToggle.IsChecked = _autoRefreshEnabled;
+
+            IncludeHiddenToggle.IsChecked = _scanIncludeHidden;
+            IncludeSystemToggle.IsChecked = _scanIncludeSystem;
+            IncludeFilesToggle.IsChecked = _scanIncludeFiles;
+            MinFileSizeTextBox.Text = $"{(_scanMinFileSizeBytes / (1024.0 * 1024.0)):0.##}";
+            ExcludedPathsTextBox.Text = string.Join(Environment.NewLine, _excludedPaths);
         }
 
         private void CloseSettingsButton_Click(object sender, RoutedEventArgs e)
@@ -1424,6 +2192,75 @@ namespace Fyle
             }
         }
 
+        private void IncludeHiddenToggle_Click(object sender, RoutedEventArgs e)
+        {
+            _scanIncludeHidden = IncludeHiddenToggle.IsChecked == true;
+            ApplyFiltersAndRefreshViews();
+        }
+
+        private void IncludeSystemToggle_Click(object sender, RoutedEventArgs e)
+        {
+            _scanIncludeSystem = IncludeSystemToggle.IsChecked == true;
+            ApplyFiltersAndRefreshViews();
+        }
+
+        private void IncludeFilesToggle_Click(object sender, RoutedEventArgs e)
+        {
+            _scanIncludeFiles = IncludeFilesToggle.IsChecked == true;
+            ApplyFiltersAndRefreshViews();
+        }
+
+        private void MinFileSizeTextBox_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            if (_isLoadingSettings) return;
+            if (MinFileSizeTextBox == null) return;
+
+            if (double.TryParse(MinFileSizeTextBox.Text, out var mb) && mb >= 0)
+            {
+                _scanMinFileSizeBytes = (long)(mb * 1024 * 1024);
+            }
+            else
+            {
+                _scanMinFileSizeBytes = 0;
+            }
+
+            ApplyFiltersAndRefreshViews();
+        }
+
+        private void ExcludedPathsTextBox_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            if (_isLoadingSettings) return;
+            if (ExcludedPathsTextBox == null) return;
+
+            _excludedPaths.Clear();
+            foreach (var line in (ExcludedPathsTextBox.Text ?? "").Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var trimmed = line.Trim();
+                if (trimmed.Length == 0) continue;
+                _excludedPaths.Add(trimmed.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            }
+
+            ApplyFiltersAndRefreshViews();
+        }
+
+        private void ExcludePath(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return;
+            var normalized = path.Trim().TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            if (_excludedPaths.Any(p => string.Equals(p, normalized, StringComparison.OrdinalIgnoreCase))) return;
+
+            _excludedPaths.Add(normalized);
+
+            if (ExcludedPathsTextBox != null)
+            {
+                _isLoadingSettings = true;
+                ExcludedPathsTextBox.Text = string.Join(Environment.NewLine, _excludedPaths);
+                _isLoadingSettings = false;
+            }
+
+            ApplyFiltersAndRefreshViews();
+        }
+
         private void StatisticsCheckbox_Changed(object sender, RoutedEventArgs e)
         {
             // Guard against being called during InitializeComponent
@@ -1504,38 +2341,26 @@ namespace Fyle
             
             try
             {
+                var baseNode = TreemapViewControl?.CurrentNode ?? _currentRoot;
+
                 var allFiles = new List<DirectoryNode>();
                 var allFolders = new List<DirectoryNode>();
-                CollectAllItems(_currentRoot, allFiles, allFolders);
-                
-                // Update largest files
+                CollectAllItems(baseNode, allFiles, allFolders);
+
+                var filteredFiles = allFiles.Where(f => f != null && PassesActiveFilters(f)).ToList();
+                var filteredFolders = allFolders.Where(f => f != null && PassesActiveFilters(f)).ToList();
+
                 if (ShowLargestFilesCheckbox?.IsChecked == true)
-                {
-                    var largestFiles = allFiles
-                        .OrderByDescending(f => f.Size)
-                        .Take(_topItemsCount)
-                        .Select(f => new { Name = f.Name, Path = f.Path, Size = FormatBytes(f.Size) })
-                        .ToList();
-                    LargestFilesList.ItemsSource = largestFiles;
-                }
-                
-                // Update largest folders
+                    UpdateLargestFiles(baseNode);
+
                 if (ShowLargestFoldersCheckbox?.IsChecked == true)
-                {
-                    var largestFolders = allFolders
-                        .Where(f => f.IsDirectory)
-                        .OrderByDescending(f => f.Size)
-                        .Take(_topItemsCount)
-                        .Select(f => new { Name = f.Name, Path = f.Path, Size = FormatBytes(f.Size) })
-                        .ToList();
-                    LargestFoldersList.ItemsSource = largestFolders;
-                }
+                    UpdateLargestFolders(baseNode);
                 
                 // Update old files
                 if (ShowOldFilesCheckbox?.IsChecked == true)
                 {
                     var oneYearAgo = DateTime.Now.AddYears(-1);
-                    var oldFiles = allFiles
+                    var oldFiles = filteredFiles
                         .Where(f => GetFileLastModified(f.Path) < oneYearAgo)
                         .OrderBy(f => GetFileLastModified(f.Path))
                         .Take(_topItemsCount)
@@ -1543,7 +2368,8 @@ namespace Fyle
                             Name = f.Name, 
                             Path = f.Path, 
                             Size = FormatBytes(f.Size),
-                            Age = GetFileAge(f.Path)
+                            Age = GetFileAge(f.Path),
+                            Node = f
                         })
                         .ToList();
                     OldFilesList.ItemsSource = oldFiles;
@@ -1552,24 +2378,79 @@ namespace Fyle
                 // Update empty folders
                 if (ShowEmptyFoldersCheckbox?.IsChecked == true)
                 {
-                    var emptyFolders = allFolders
-                        .Where(f => f.IsDirectory && f.Size == 0 && f.Children.Count == 0)
+                    var emptyFolders = filteredFolders
+                        .Where(f => f.IsDirectory && f.Size == 0 && (f.Children?.Count ?? 0) == 0)
                         .Take(_topItemsCount)
-                        .Select(f => new { Name = f.Name, Path = f.Path })
+                        .Select(f => new { Name = f.Name, Path = f.Path, Node = f })
                         .ToList();
                     EmptyFoldersList.ItemsSource = emptyFolders;
                     NoEmptyFoldersText.Visibility = emptyFolders.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
                 }
                 
                 // Update age distribution chart
-                UpdateAgeDistribution(allFiles);
+                UpdateAgeDistribution(filteredFiles);
                 
                 // Update compression stats
-                UpdateCompressionStats(allFiles);
+                UpdateCompressionStats(filteredFiles);
+
+                UpdateOwnerDistribution(filteredFiles);
             }
             catch (Exception ex)
             {
                 LogError("UpdateStatistics", ex);
+            }
+        }
+
+        private void UpdateOwnerDistribution(List<DirectoryNode> allFiles)
+        {
+            try
+            {
+                if (OwnerDistributionList == null || OwnerDistributionSection == null) return;
+
+                var files = allFiles.Where(f => f != null && !string.IsNullOrWhiteSpace(f.Path)).Take(5000).ToList();
+                if (files.Count == 0)
+                {
+                    OwnerDistributionList.ItemsSource = null;
+                    OwnerDistributionSection.Visibility = Visibility.Collapsed;
+                    return;
+                }
+
+                var totals = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+                long totalSize = 0;
+
+                foreach (var f in files)
+                {
+                    var owner = GetOwnerCached(f.Path ?? "", false);
+                    if (string.IsNullOrWhiteSpace(owner)) continue;
+                    if (!totals.TryGetValue(owner, out var current)) current = 0;
+                    totals[owner] = current + f.Size;
+                    totalSize += f.Size;
+                }
+
+                if (totals.Count == 0 || totalSize <= 0)
+                {
+                    OwnerDistributionList.ItemsSource = null;
+                    OwnerDistributionSection.Visibility = Visibility.Collapsed;
+                    return;
+                }
+
+                var top = totals
+                    .OrderByDescending(kvp => kvp.Value)
+                    .Take(8)
+                    .Select(kvp => new
+                    {
+                        Name = kvp.Key,
+                        Size = FormatBytes(kvp.Value),
+                        Percentage = (kvp.Value / (double)totalSize) * 100
+                    })
+                    .ToList();
+
+                OwnerDistributionList.ItemsSource = top;
+                OwnerDistributionSection.Visibility = Visibility.Visible;
+            }
+            catch (Exception ex)
+            {
+                LogError("UpdateOwnerDistribution", ex);
             }
         }
         
@@ -1779,7 +2660,7 @@ namespace Fyle
                 {
                     try
                     {
-                        Directory.Delete(path);
+                        FileSystem.DeleteDirectory(path, UIOption.OnlyErrorDialogs, RecycleOption.SendToRecycleBin);
                         StatusText.Text = $"Deleted: {System.IO.Path.GetFileName(path)}";
                         
                         // Refresh empty folders list
@@ -1797,11 +2678,81 @@ namespace Fyle
             }
         }
 
+        private void CrashReportButton_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var dialog = new SaveFileDialog
+                {
+                    Filter = "Zip File|*.zip",
+                    FileName = $"Fyle_CrashReport_{DateTime.Now:yyyyMMdd_HHmmss}.zip"
+                };
+
+                if (dialog.ShowDialog() != true) return;
+
+                var zipPath = dialog.FileName;
+                if (File.Exists(zipPath)) File.Delete(zipPath);
+
+                using var zip = ZipFile.Open(zipPath, ZipArchiveMode.Create);
+
+                var envEntry = zip.CreateEntry("environment.txt", CompressionLevel.Optimal);
+                using (var stream = envEntry.Open())
+                using (var writer = new StreamWriter(stream, Encoding.UTF8))
+                {
+                    var asm = Assembly.GetExecutingAssembly().GetName();
+                    writer.WriteLine($"appName={asm.Name}");
+                    writer.WriteLine($"appVersion={asm.Version}");
+                    writer.WriteLine($"osVersion={Environment.OSVersion}");
+                    writer.WriteLine($"is64BitProcess={Environment.Is64BitProcess}");
+                    writer.WriteLine($"machineName={Environment.MachineName}");
+                    writer.WriteLine($"userName={Environment.UserName}");
+                    writer.WriteLine($"utcNow={DateTime.UtcNow:O}");
+                    writer.WriteLine($"currentDrive={_currentDrive}");
+                    writer.WriteLine($"settingsPath={GetSettingsPath()}");
+                    writer.WriteLine($"logPath={Logger.GetLogPath()}");
+                }
+
+                TryAddFileToZip(zip, Logger.GetLogPath(), "logs/fyle_log.txt");
+                TryAddFileToZip(zip, GetSettingsPath(), "settings/settings.txt");
+
+                StatusText.Text = "Crash report created";
+
+                var result = MessageBox.Show("Crash report created. Open folder?", "Fyle", MessageBoxButton.YesNo, MessageBoxImage.Information);
+                if (result == MessageBoxResult.Yes)
+                {
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = "explorer.exe",
+                        Arguments = $"/select,\"{zipPath}\"",
+                        UseShellExecute = true
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError("CrashReportButton_Click", ex);
+                MessageBox.Show($"Failed to create crash report: {ex.Message}", "Fyle", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private static void TryAddFileToZip(ZipArchive zip, string filePath, string entryName)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(filePath)) return;
+                if (!File.Exists(filePath)) return;
+                zip.CreateEntryFromFile(filePath, entryName, CompressionLevel.Optimal);
+            }
+            catch { }
+        }
+
         private void SaveSettings()
         {
             try
             {
-                var settingsPath = System.IO.Path.Combine(AppContext.BaseDirectory, "fyle_settings.txt");
+                var settingsPath = GetSettingsPath();
+                Directory.CreateDirectory(Path.GetDirectoryName(settingsPath)!);
+
                 var lines = new List<string>
                 {
                     $"DarkMode={_isDarkMode}",
@@ -1813,8 +2764,24 @@ namespace Fyle
                     $"ShowLargestFolders={ShowLargestFoldersCheckbox?.IsChecked ?? true}",
                     $"ShowDuplicates={ShowDuplicatesCheckbox?.IsChecked ?? true}",
                     $"ShowOldFiles={ShowOldFilesCheckbox?.IsChecked ?? false}",
-                    $"ShowEmptyFolders={ShowEmptyFoldersCheckbox?.IsChecked ?? false}"
+                    $"ShowEmptyFolders={ShowEmptyFoldersCheckbox?.IsChecked ?? false}",
+                    $"LastDrive={_currentDrive ?? ""}",
+                    $"SearchText={SearchBox?.Text ?? ""}",
+                    $"FileTypeFilterIndex={FileTypeFilter?.SelectedIndex ?? 0}",
+                    $"OwnerFilter={GetOwnerFilterValue()}",
+                    $"IncludeHidden={_scanIncludeHidden}",
+                    $"IncludeSystem={_scanIncludeSystem}",
+                    $"IncludeFiles={_scanIncludeFiles}",
+                    $"MinFileSizeBytes={_scanMinFileSizeBytes}",
+                    $"MaxItemsToRender={_maxItemsToRender}"
                 };
+
+                foreach (var p in _excludedPaths)
+                {
+                    if (string.IsNullOrWhiteSpace(p)) continue;
+                    lines.Add($"ExcludedPath={p}");
+                }
+
                 File.WriteAllLines(settingsPath, lines);
             }
             catch (Exception ex)
@@ -1827,15 +2794,37 @@ namespace Fyle
         {
             try
             {
-                var settingsPath = System.IO.Path.Combine(AppContext.BaseDirectory, "fyle_settings.txt");
+                _isLoadingSettings = true;
+
+                var settingsPath = GetSettingsPath();
+                var legacyPath = Path.Combine(AppContext.BaseDirectory, "fyle_settings.txt");
+
+                if (!File.Exists(settingsPath) && File.Exists(legacyPath))
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(settingsPath)!);
+                    File.Copy(legacyPath, settingsPath, true);
+                }
+
                 if (!File.Exists(settingsPath)) return;
-                
-                var settings = File.ReadAllLines(settingsPath)
-                    .Where(l => l.Contains('='))
-                    .ToDictionary(
-                        l => l.Split('=')[0],
-                        l => l.Split('=')[1]
-                    );
+
+                var settings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                var excluded = new List<string>();
+
+                foreach (var line in File.ReadAllLines(settingsPath))
+                {
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    var idx = line.IndexOf('=');
+                    if (idx <= 0) continue;
+                    var key = line.Substring(0, idx).Trim();
+                    var value = line.Substring(idx + 1);
+                    if (key.Equals("ExcludedPath", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!string.IsNullOrWhiteSpace(value))
+                            excluded.Add(value.Trim());
+                        continue;
+                    }
+                    settings[key] = value;
+                }
                 
                 if (settings.TryGetValue("DarkMode", out var darkMode) && bool.TryParse(darkMode, out var isDark))
                 {
@@ -1867,6 +2856,51 @@ namespace Fyle
                         }
                     }
                 }
+
+                if (settings.TryGetValue("LastDrive", out var lastDrive) && !string.IsNullOrWhiteSpace(lastDrive))
+                    _currentDrive = lastDrive;
+
+                if (settings.TryGetValue("SearchText", out var searchText) && SearchBox != null)
+                    SearchBox.Text = searchText;
+
+                if (settings.TryGetValue("FileTypeFilterIndex", out var filterIdx) && int.TryParse(filterIdx, out var idxValue) && FileTypeFilter != null)
+                    FileTypeFilter.SelectedIndex = Math.Max(0, Math.Min(FileTypeFilter.Items.Count - 1, idxValue));
+
+                if (settings.TryGetValue("OwnerFilter", out var ownerFilterValue))
+                {
+                    _ownerFilter = ownerFilterValue ?? "";
+                    _pendingOwnerFilter = _ownerFilter;
+                    if (OwnerFilter != null) OwnerFilter.SelectedValue = _ownerFilter;
+                }
+
+                if (settings.TryGetValue("IncludeHidden", out var includeHidden) && bool.TryParse(includeHidden, out var ih))
+                    _scanIncludeHidden = ih;
+
+                if (settings.TryGetValue("IncludeSystem", out var includeSystem) && bool.TryParse(includeSystem, out var isys))
+                    _scanIncludeSystem = isys;
+
+                if (settings.TryGetValue("IncludeFiles", out var includeFiles) && bool.TryParse(includeFiles, out var ifiles))
+                    _scanIncludeFiles = ifiles;
+
+                if (settings.TryGetValue("MinFileSizeBytes", out var minBytes) && long.TryParse(minBytes, out var mb))
+                    _scanMinFileSizeBytes = Math.Max(0, mb);
+
+                if (settings.TryGetValue("MaxItemsToRender", out var maxRender) && int.TryParse(maxRender, out var mir))
+                    _maxItemsToRender = Math.Max(500, mir);
+
+                _excludedPaths.Clear();
+                foreach (var p in excluded)
+                {
+                    var normalized = p.Trim().TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                    if (normalized.Length == 0) continue;
+                    _excludedPaths.Add(normalized);
+                }
+
+                if (IncludeHiddenToggle != null) IncludeHiddenToggle.IsChecked = _scanIncludeHidden;
+                if (IncludeSystemToggle != null) IncludeSystemToggle.IsChecked = _scanIncludeSystem;
+                if (IncludeFilesToggle != null) IncludeFilesToggle.IsChecked = _scanIncludeFiles;
+                if (MinFileSizeTextBox != null) MinFileSizeTextBox.Text = $"{(_scanMinFileSizeBytes / (1024.0 * 1024.0)):0.##}";
+                if (ExcludedPathsTextBox != null) ExcludedPathsTextBox.Text = string.Join(Environment.NewLine, _excludedPaths);
                 
                 if (settings.TryGetValue("ShowFileTypeStats", out var showTypes) && bool.TryParse(showTypes, out var showT))
                     ShowFileTypeStatsCheckbox.IsChecked = showT;
@@ -1887,11 +2921,24 @@ namespace Fyle
                     ShowEmptyFoldersCheckbox.IsChecked = showE;
                 
                 UpdateStatisticsVisibility();
+                ApplyFiltersToTreemap();
             }
             catch (Exception ex)
             {
                 LogError("LoadSettings", ex);
             }
+            finally
+            {
+                _isLoadingSettings = false;
+            }
+        }
+
+        private static string GetSettingsPath()
+        {
+            var baseDir = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (string.IsNullOrWhiteSpace(baseDir))
+                baseDir = AppContext.BaseDirectory;
+            return Path.Combine(baseDir, "Fyle", "settings.txt");
         }
 
         private string FormatBytes(long bytes)
@@ -2022,6 +3069,9 @@ namespace Fyle
                 
                 if (maxRadius < 50) return;
                 
+                var treemap = TreemapViewControl;
+                var canGoBack = treemap?.CanGoBack() == true;
+
                 // Draw center circle (clickable to go back)
                 var centerCircle = new System.Windows.Shapes.Ellipse
                 {
@@ -2030,22 +3080,22 @@ namespace Fyle
                     Fill = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#2D3748")),
                     Stroke = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#4A5568")),
                     StrokeThickness = 2,
-                    Cursor = TreemapViewControl.CanGoBack() ? Cursors.Hand : Cursors.Arrow,
-                    ToolTip = TreemapViewControl.CanGoBack() ? "Click to go back" : currentNode.Name
+                    Cursor = canGoBack ? Cursors.Hand : Cursors.Arrow,
+                    ToolTip = canGoBack ? "Click to go back" : currentNode.Name
                 };
                 centerCircle.MouseLeftButtonDown += (s, e) =>
                 {
-                    if (TreemapViewControl.CanGoBack())
+                    if (treemap?.CanGoBack() == true)
                     {
-                        TreemapViewControl.GoBack();
+                        treemap.GoBack();
                         UpdateSunburstView();
                         UpdateBreadcrumb();
-                        BackButton.IsEnabled = TreemapViewControl.CanGoBack();
+                        BackButton.IsEnabled = treemap.CanGoBack();
                     }
                 };
                 centerCircle.MouseEnter += (s, e) =>
                 {
-                    if (TreemapViewControl.CanGoBack())
+                    if (treemap?.CanGoBack() == true)
                         centerCircle.Fill = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#3D4758"));
                 };
                 centerCircle.MouseLeave += (s, e) =>
@@ -2184,6 +3234,40 @@ namespace Fyle
             }
         }
 
+        private string BuildListItemCountText(DirectoryNode node)
+        {
+            if (!node.IsDirectory) return "File";
+            var count = node.Children?.Count ?? 0;
+            return $"{count:N0} items";
+        }
+
+        private string BuildListDetailsText(DirectoryNode node)
+        {
+            var path = node.Path ?? "";
+            if (string.IsNullOrWhiteSpace(path)) return "";
+
+            var modified = GetLastWriteTimeSafe(path, node.IsDirectory);
+            var accessed = GetLastAccessTimeSafe(path, node.IsDirectory);
+
+            var parts = new List<string>();
+            var ownerFilter = GetOwnerFilterValue();
+            var owner = GetOwnerCached(path, node.IsDirectory);
+
+            if (!string.IsNullOrWhiteSpace(owner))
+                parts.Add($"Owner: {owner}");
+
+            if (modified != DateTime.MinValue)
+                parts.Add($"Modified: {modified:yyyy-MM-dd}");
+
+            if (accessed != DateTime.MinValue)
+                parts.Add($"Accessed: {accessed:yyyy-MM-dd}");
+
+            if (!string.IsNullOrWhiteSpace(ownerFilter) && string.IsNullOrWhiteSpace(owner))
+                parts.Add("Owner: Unknown");
+
+            return string.Join(" • ", parts);
+        }
+
         private void UpdateListView()
         {
             if (_currentRoot == null || FileListView == null) return;
@@ -2193,9 +3277,13 @@ namespace Fyle
                 var currentNode = TreemapViewControl?.CurrentNode ?? _currentRoot;
                 if (currentNode == null) return;
                 
-                var maxSize = currentNode.Children.Count > 0 ? currentNode.Children.Max(c => c.Size) : 1;
+                var filteredChildren = (currentNode.Children?.ToList() ?? new List<DirectoryNode>())
+                    .Where(c => c != null && PassesActiveFilters(c))
+                    .ToList();
+
+                var maxSize = filteredChildren.Count > 0 ? filteredChildren.Max(c => c.Size) : 1;
                 
-                var items = currentNode.Children
+                var items = filteredChildren
                     .OrderByDescending(c => c.Size)
                     .Select(c => new
                     {
@@ -2203,7 +3291,8 @@ namespace Fyle
                         c.Name,
                         FormattedSize = FormatBytes(c.Size),
                         Percentage = currentNode.Size > 0 ? $"{(c.Size * 100.0 / currentNode.Size):F1}%" : "0%",
-                        ItemCount = c.IsDirectory ? c.Children.Count.ToString() : "File",
+                        ItemCountText = BuildListItemCountText(c),
+                        DetailsText = BuildListDetailsText(c),
                         Icon = c.IsDirectory ? "📁" : "📄",
                         BarWidth = maxSize > 0 ? (c.Size / (double)maxSize) * 100 : 0
                     })
@@ -2231,6 +3320,10 @@ namespace Fyle
                         UpdateSunburstView();
                         UpdateBreadcrumb();
                         BackButton.IsEnabled = TreemapViewControl.CanGoBack();
+                    }
+                    else if (item.Node is DirectoryNode fileNode && !fileNode.IsDirectory && !string.IsNullOrWhiteSpace(fileNode.Path))
+                    {
+                        ShowInExplorer(fileNode.Path);
                     }
                 }
                 catch { }

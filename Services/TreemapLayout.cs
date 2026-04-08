@@ -43,16 +43,42 @@ namespace Fyle.Services
                     return result;
                 }
 
-                double totalSize = items.Sum(i => i.Size);
-                if (totalSize <= 0) totalSize = 1;
-
-                Squarify(items, 0, items.Count, space, totalSize, result, minSize);
+                return CalculateLayout(items, space, minSize);
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"CalculateLayout error: {ex.Message}");
                 if (node != null)
                     result.Add(new TreemapItem { Node = node, Bounds = space });
+            }
+
+            return result;
+        }
+
+        public static List<TreemapItem> CalculateLayout(IEnumerable<DirectoryNode> items, Rect space, double minSize = 1.0)
+        {
+            var result = new List<TreemapItem>();
+
+            try
+            {
+                if (items == null) return result;
+                if (space.Width <= 0 || space.Height <= 0) return result;
+
+                var list = items
+                    .Where(c => c != null && c.Size > 0)
+                    .OrderByDescending(c => c.Size)
+                    .ToList();
+
+                if (list.Count == 0) return result;
+
+                double totalSize = list.Sum(i => i.Size);
+                if (totalSize <= 0) totalSize = 1;
+
+                Squarify(list, 0, list.Count, space, totalSize, result, minSize);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"CalculateLayout(items) error: {ex.Message}");
             }
 
             return result;

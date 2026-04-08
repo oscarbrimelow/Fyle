@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using Fyle.Core;
 
 namespace Fyle.Services
@@ -12,16 +13,46 @@ namespace Fyle.Services
     /// </summary>
     public class ExportService
     {
-        public static void ExportToCsv(DirectoryNode root, string filePath, int maxDepth = 10)
+        public class ExportMetadata
         {
-            using var writer = new StreamWriter(filePath, false, Encoding.UTF8);
-            writer.WriteLine("Path,Name,Size (Bytes),Size (Formatted),Type,Depth,Parent");
-            ExportNodeCsv(writer, root, "", 0, maxDepth);
+            public string AppVersion { get; set; } = "";
+            public DateTime ExportedAtUtc { get; set; } = DateTime.UtcNow;
+            public string ScanTargetPath { get; set; } = "";
+            public bool UsedMft { get; set; }
+            public string FilterText { get; set; } = "";
+            public int FileTypeFilterIndex { get; set; }
+            public bool IncludeHidden { get; set; } = true;
+            public bool IncludeSystem { get; set; } = true;
+            public bool IncludeFiles { get; set; } = true;
+            public long MinFileSizeBytes { get; set; }
+            public List<string> ExcludedPaths { get; set; } = new();
         }
 
-        private static void ExportNodeCsv(StreamWriter writer, DirectoryNode node, string parent, int depth, int maxDepth)
+        public static void ExportToCsv(DirectoryNode root, string filePath, int maxDepth = 10)
+        {
+            ExportToCsv(root, filePath, new ExportMetadata(), CancellationToken.None, maxDepth);
+        }
+
+        public static void ExportToCsv(DirectoryNode root, string filePath, ExportMetadata metadata, CancellationToken cancellationToken, int maxDepth = 10)
+        {
+            using var writer = new StreamWriter(filePath, false, Encoding.UTF8);
+
+            writer.WriteLine("Key,Value");
+            foreach (var kvp in MetadataToPairs(metadata, root))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                writer.WriteLine($"\"{kvp.Key.Replace("\"", "\"\"")}\",\"{kvp.Value.Replace("\"", "\"\"")}\"");
+            }
+            writer.WriteLine();
+
+            writer.WriteLine("Path,Name,Size (Bytes),Size (Formatted),Type,Depth,Parent");
+            ExportNodeCsv(writer, root, "", 0, maxDepth, cancellationToken);
+        }
+
+        private static void ExportNodeCsv(StreamWriter writer, DirectoryNode node, string parent, int depth, int maxDepth, CancellationToken cancellationToken)
         {
             if (depth > maxDepth) return;
+            cancellationToken.ThrowIfCancellationRequested();
             
             var type = node.IsDirectory ? "Folder" : "File";
             var escapedPath = $"\"{node.Path?.Replace("\"", "\"\"") ?? ""}\"";
@@ -32,12 +63,18 @@ namespace Fyle.Services
             
             foreach (var child in node.Children.OrderByDescending(c => c.Size))
             {
-                ExportNodeCsv(writer, child, node.Name ?? "", depth + 1, maxDepth);
+                ExportNodeCsv(writer, child, node.Name ?? "", depth + 1, maxDepth, cancellationToken);
             }
         }
 
         public static void ExportToHtml(DirectoryNode root, string filePath, string title = "Fyle Disk Report")
         {
+            ExportToHtml(root, filePath, title, new ExportMetadata(), CancellationToken.None);
+        }
+
+        public static void ExportToHtml(DirectoryNode root, string filePath, string title, ExportMetadata metadata, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
             var sb = new StringBuilder();
             
             sb.AppendLine("<!DOCTYPE html>");
@@ -69,7 +106,22 @@ namespace Fyle.Services
             sb.AppendLine("<body>");
             sb.AppendLine("  <div class=\"container\">");
             sb.AppendLine($"    <h1>📊 {title}</h1>");
-            sb.AppendLine($"    <p>Scanned: <strong>{root.Path}</strong> on {DateTime.Now:yyyy-MM-dd HH:mm}</p>");
+            sb.AppendLine($"    <p>Scanned: <strong>{root.Path}</strong></p>");
+            sb.AppendLine($"    <p style=\"color:#666;\">Exported: {metadata.ExportedAtUtc:yyyy-MM-dd HH:mm} UTC • App: {EscapeHtml(metadata.AppVersion)} • MFT: {(metadata.UsedMft ? "Yes" : "No")}</p>");
+            if (!string.IsNullOrWhiteSpace(metadata.FilterText) || metadata.FileTypeFilterIndex != 0 || metadata.MinFileSizeBytes > 0 || (metadata.ExcludedPaths?.Count ?? 0) > 0)
+            {
+                sb.AppendLine("    <div style=\"background:#f8f9fa;border-radius:6px;padding:12px 14px;margin:10px 0;\">");
+                sb.AppendLine("      <div style=\"font-weight:600;margin-bottom:6px;\">Filters</div>");
+                sb.AppendLine($"      <div style=\"color:#666;\">Search: <strong>{EscapeHtml(metadata.FilterText)}</strong></div>");
+                sb.AppendLine($"      <div style=\"color:#666;\">Type filter index: <strong>{metadata.FileTypeFilterIndex}</strong></div>");
+                sb.AppendLine($"      <div style=\"color:#666;\">Min file size: <strong>{FormatBytes(metadata.MinFileSizeBytes)}</strong></div>");
+                sb.AppendLine($"      <div style=\"color:#666;\">Include hidden: <strong>{metadata.IncludeHidden}</strong> • Include system: <strong>{metadata.IncludeSystem}</strong> • Include files: <strong>{metadata.IncludeFiles}</strong></div>");
+                if ((metadata.ExcludedPaths?.Count ?? 0) > 0)
+                {
+                    sb.AppendLine($"      <div style=\"color:#666;\">Excluded: <strong>{metadata.ExcludedPaths?.Count ?? 0}</strong></div>");
+                }
+                sb.AppendLine("    </div>");
+            }
             
             // Summary stats
             sb.AppendLine("    <div class=\"summary\">");
@@ -90,6 +142,7 @@ namespace Fyle.Services
                 
             foreach (var folder in topFolders)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var percent = root.Size > 0 ? (folder.Size / (double)root.Size) * 100 : 0;
                 sb.AppendLine($"      <tr>");
                 sb.AppendLine($"        <td class=\"folder\">📁 {folder.Name}</td>");
@@ -112,6 +165,7 @@ namespace Fyle.Services
             
             foreach (var file in topFiles)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var dir = Path.GetDirectoryName(file.Path) ?? "";
                 sb.AppendLine($"      <tr>");
                 sb.AppendLine($"        <td class=\"file\">{file.Name}</td>");
@@ -122,7 +176,7 @@ namespace Fyle.Services
             
             sb.AppendLine("    </table>");
             
-            sb.AppendLine($"    <div class=\"footer\">Generated by Fyle v1.0 - {DateTime.Now:yyyy-MM-dd HH:mm:ss}</div>");
+            sb.AppendLine($"    <div class=\"footer\">Generated by Fyle - {DateTime.Now:yyyy-MM-dd HH:mm:ss}</div>");
             sb.AppendLine("  </div>");
             sb.AppendLine("</body>");
             sb.AppendLine("</html>");
@@ -132,16 +186,25 @@ namespace Fyle.Services
 
         public static void ExportToJson(DirectoryNode root, string filePath, int maxDepth = 10)
         {
-            var data = ConvertToDict(root, 0, maxDepth);
-            var json = System.Text.Json.JsonSerializer.Serialize(data, new System.Text.Json.JsonSerializerOptions 
-            { 
-                WriteIndented = true 
-            });
+            ExportToJson(root, filePath, new ExportMetadata(), CancellationToken.None, maxDepth);
+        }
+
+        public static void ExportToJson(DirectoryNode root, string filePath, ExportMetadata metadata, CancellationToken cancellationToken, int maxDepth = 10)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var payload = new Dictionary<string, object>
+            {
+                ["metadata"] = MetadataToPairs(metadata, root).ToDictionary(k => k.Key, v => v.Value),
+                ["root"] = ConvertToDict(root, 0, maxDepth, cancellationToken)
+            };
+            var json = System.Text.Json.JsonSerializer.Serialize(payload, new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+            cancellationToken.ThrowIfCancellationRequested();
             File.WriteAllText(filePath, json);
         }
 
-        private static Dictionary<string, object> ConvertToDict(DirectoryNode node, int depth, int maxDepth)
+        private static Dictionary<string, object> ConvertToDict(DirectoryNode node, int depth, int maxDepth, CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var dict = new Dictionary<string, object>
             {
                 ["name"] = node.Name ?? "",
@@ -156,7 +219,7 @@ namespace Fyle.Services
                 dict["children"] = node.Children
                     .OrderByDescending(c => c.Size)
                     .Take(100) // Limit children per folder
-                    .Select(c => ConvertToDict(c, depth + 1, maxDepth))
+                    .Select(c => ConvertToDict(c, depth + 1, maxDepth, cancellationToken))
                     .ToList();
             }
 
@@ -165,17 +228,32 @@ namespace Fyle.Services
 
         public static void ExportToXml(DirectoryNode root, string filePath, int maxDepth = 10)
         {
+            ExportToXml(root, filePath, new ExportMetadata(), CancellationToken.None, maxDepth);
+        }
+
+        public static void ExportToXml(DirectoryNode root, string filePath, ExportMetadata metadata, CancellationToken cancellationToken, int maxDepth = 10)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
             var sb = new StringBuilder();
             sb.AppendLine("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
-            sb.AppendLine($"<FyleScan date=\"{DateTime.Now:yyyy-MM-dd HH:mm:ss}\">");
-            ExportNodeXml(sb, root, 1, 0, maxDepth);
+            sb.AppendLine($"<FyleScan exportedAtUtc=\"{metadata.ExportedAtUtc:O}\" appVersion=\"{EscapeXml(metadata.AppVersion)}\">");
+            sb.AppendLine("  <Metadata>");
+            foreach (var kvp in MetadataToPairs(metadata, root))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                sb.AppendLine($"    <Item key=\"{EscapeXml(kvp.Key)}\" value=\"{EscapeXml(kvp.Value)}\" />");
+            }
+            sb.AppendLine("  </Metadata>");
+            ExportNodeXml(sb, root, 1, 0, maxDepth, cancellationToken);
             sb.AppendLine("</FyleScan>");
+            cancellationToken.ThrowIfCancellationRequested();
             File.WriteAllText(filePath, sb.ToString());
         }
 
-        private static void ExportNodeXml(StringBuilder sb, DirectoryNode node, int indent, int depth, int maxDepth)
+        private static void ExportNodeXml(StringBuilder sb, DirectoryNode node, int indent, int depth, int maxDepth, CancellationToken cancellationToken)
         {
             if (depth > maxDepth) return;
+            cancellationToken.ThrowIfCancellationRequested();
             
             var padding = new string(' ', indent * 2);
             var type = node.IsDirectory ? "Folder" : "File";
@@ -187,7 +265,7 @@ namespace Fyle.Services
                 sb.AppendLine($"{padding}<{type} name=\"{escapedName}\" size=\"{node.Size}\" sizeFormatted=\"{node.FormattedSize}\">");
                 foreach (var child in node.Children.OrderByDescending(c => c.Size).Take(100))
                 {
-                    ExportNodeXml(sb, child, indent + 1, depth + 1, maxDepth);
+                    ExportNodeXml(sb, child, indent + 1, depth + 1, maxDepth, cancellationToken);
                 }
                 sb.AppendLine($"{padding}</{type}>");
             }
@@ -210,6 +288,59 @@ namespace Fyle.Services
                     CollectFiles(child, files);
                 }
             }
+        }
+
+        private static List<KeyValuePair<string, string>> MetadataToPairs(ExportMetadata metadata, DirectoryNode root)
+        {
+            var pairs = new List<KeyValuePair<string, string>>
+            {
+                new("appVersion", metadata.AppVersion ?? ""),
+                new("exportedAtUtc", metadata.ExportedAtUtc.ToString("O")),
+                new("scanTargetPath", metadata.ScanTargetPath ?? root.Path ?? ""),
+                new("usedMft", metadata.UsedMft ? "true" : "false"),
+                new("filterText", metadata.FilterText ?? ""),
+                new("fileTypeFilterIndex", metadata.FileTypeFilterIndex.ToString()),
+                new("includeHidden", metadata.IncludeHidden ? "true" : "false"),
+                new("includeSystem", metadata.IncludeSystem ? "true" : "false"),
+                new("includeFiles", metadata.IncludeFiles ? "true" : "false"),
+                new("minFileSizeBytes", metadata.MinFileSizeBytes.ToString()),
+                new("excludedPathsCount", (metadata.ExcludedPaths?.Count ?? 0).ToString()),
+                new("totalSizeBytes", root.Size.ToString()),
+                new("totalSizeFormatted", root.FormattedSize ?? ""),
+                new("fileCount", root.FileCount.ToString()),
+                new("folderCount", root.DirectoryCount.ToString())
+            };
+
+            if (metadata.ExcludedPaths != null && metadata.ExcludedPaths.Count > 0)
+            {
+                pairs.Add(new("excludedPaths", string.Join(" | ", metadata.ExcludedPaths)));
+            }
+
+            return pairs;
+        }
+
+        private static string EscapeHtml(string? s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;");
+        }
+
+        private static string EscapeXml(string? s)
+        {
+            return System.Security.SecurityElement.Escape(s ?? "") ?? "";
+        }
+
+        private static string FormatBytes(long bytes)
+        {
+            string[] sizes = { "B", "KB", "MB", "GB", "TB" };
+            double len = bytes;
+            int order = 0;
+            while (len >= 1024 && order < sizes.Length - 1)
+            {
+                order++;
+                len = len / 1024;
+            }
+            return $"{len:0.##} {sizes[order]}";
         }
     }
 }

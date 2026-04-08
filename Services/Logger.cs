@@ -10,8 +10,16 @@ namespace Fyle.Services
 
         static Logger()
         {
-            var appDir = AppContext.BaseDirectory;
-            LogPath = Path.Combine(appDir, "fyle_crash_log.txt");
+            var logDir = GetDefaultLogDirectory();
+            try
+            {
+                Directory.CreateDirectory(logDir);
+                LogPath = Path.Combine(logDir, "fyle_log.txt");
+            }
+            catch
+            {
+                LogPath = Path.Combine(AppContext.BaseDirectory, "fyle_log.txt");
+            }
             
             // Clear old log on startup
             try
@@ -51,6 +59,16 @@ namespace Fyle.Services
         }
 
         public static string GetLogPath() => LogPath;
+
+        private static string GetDefaultLogDirectory()
+        {
+            var baseDir = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (string.IsNullOrWhiteSpace(baseDir))
+            {
+                baseDir = AppContext.BaseDirectory;
+            }
+            return Path.Combine(baseDir, "Fyle", "Logs");
+        }
     }
 }
 
